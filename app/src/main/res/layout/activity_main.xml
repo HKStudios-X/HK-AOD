@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="20dp"
+    android:background="#141313"
+    tools:context=".MainActivity">
+
+
+    <TextView
+        android:layout_width="195dp"
+        android:layout_height="50dp"
+        android:layout_marginBottom="30dp"
+        android:fontFamily="sans-serif-light"
+        android:text="HK AOD Settings"
+        android:textColor="#E0D8D8"
+        android:textSize="26sp"
+        android:textStyle="bold"
+        tools:ignore="HardcodedText" />
+
+    <Switch
+        android:id="@+id/swAlwaysOn"
+        android:layout_width="290dp"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="10dp"
+        android:padding="15dp"
+        android:text="Always On Display"
+        android:fontFamily="cursive"
+        android:textSize="18sp"
+        tools:ignore="HardcodedText,UseSwitchCompatOrMaterialXml" />
+
+    <!-- Lift to Wake Toggle -->
+    <Switch
+        android:id="@+id/swLift"
+        android:layout_width="290dp"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="10dp"
+        android:padding="15dp"
+        android:text="Lift to Wake"
+        android:fontFamily="cursive"
+        android:textSize="18sp"
+        tools:ignore="HardcodedText,UseSwitchCompatOrMaterialXml" />
+
+    <!-- Wave to Wake Toggle -->
+    <Switch
+        android:id="@+id/swWave"
+        android:layout_width="290dp"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="20dp"
+        android:padding="15dp"
+        android:text="Wave to Wake (Proximity)"
+        android:fontFamily="cursive"
+        android:textSize="18sp"
+        tools:ignore="HardcodedText,UseSwitchCompatOrMaterialXml" />
+
+    <Button
+        android:id="@+id/btnBattery"
+        android:layout_width="189dp"
+        android:layout_height="70dp"
+        android:layout_marginTop="10dp"
+        android:backgroundTint="#000000"
+        android:text="Allow Background Running"
+        android:fontFamily="sans-serif-condensed-light"
+        android:textColor="#FFFFFF" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="20dp"
+        android:text="Note: Enable background permission to keep sensors active when screen is off."
+        android:textColor="#666666"
+        android:textSize="12sp" />
+
+</LinearLayout>

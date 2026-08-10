@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">HKAOD</string>
+    <string name="accessibility_desc">Controls AOD Screen and Gestures to prevent accidental touches.</string>
+</resources>

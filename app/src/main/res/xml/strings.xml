@@ -1,0 +1,5 @@
+<resources>
+    <string name="HKAOD">HK AOD</string>
+
+    <string name="accessibility_service_description">This service is used to manage the AOD screen and prevent accidental touches or system gestures.</string>
+</resources>
