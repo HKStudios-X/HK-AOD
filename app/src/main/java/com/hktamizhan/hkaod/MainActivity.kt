@@ -13,6 +13,7 @@ import android.os.Bundle
 import android.text.TextUtils
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -27,6 +28,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
@@ -48,18 +50,25 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.core.app.NotificationCompat
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -72,6 +81,10 @@ import com.airbnb.lottie.compose.LottieCompositionSpec
 import com.airbnb.lottie.compose.LottieConstants
 import com.airbnb.lottie.compose.animateLottieCompositionAsState
 import com.airbnb.lottie.compose.rememberLottieComposition
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Locale
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import rikka.shizuku.Shizuku
 import androidx.compose.runtime.collectAsState
@@ -107,6 +120,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // Restore the user's clock style / size / custom font before any UI is
+        // built so the selection survives process restarts.
+        ClockStyleRepository.loadFromPrefs(this)
         if (!isAccessibilityServiceEnabled(this)) {
             Toast.makeText(
                 this,
@@ -144,35 +160,21 @@ class MainActivity : ComponentActivity() {
 fun MainAppContainer() {
     val navController = rememberNavController()
     var isMenuOpen by remember { mutableStateOf(false) }
+    var showPositionSettings by remember { mutableStateOf(false) }
+
+    // System back must close the drawer / positions screen instead of
+    // finishing the whole activity.
+    BackHandler(enabled = isMenuOpen) { isMenuOpen = false }
+    BackHandler(enabled = showPositionSettings) { showPositionSettings = false }
 
     Box(modifier = Modifier.fillMaxSize()) {
         NavHost(
             navController = navController,
             startDestination = "main_settings",
-            enterTransition = {
-                slideInHorizontally(
-                    initialOffsetX = { fullWidth -> fullWidth },
-                    animationSpec = tween(700, easing = FastOutSlowInEasing)
-                )
-            },
-            exitTransition = {
-                slideOutHorizontally(
-                    targetOffsetX = { fullWidth -> -fullWidth },
-                    animationSpec = tween(700, easing = FastOutSlowInEasing)
-                )
-            },
-            popEnterTransition = {
-                slideInHorizontally(
-                    initialOffsetX = { fullWidth -> -fullWidth },
-                    animationSpec = tween(700, easing = FastOutSlowInEasing)
-                )
-            },
-            popExitTransition = {
-                slideOutHorizontally(
-                    targetOffsetX = { fullWidth -> fullWidth },
-                    animationSpec = tween(700, easing = FastOutSlowInEasing)
-                )
-            }
+            enterTransition = { EnterTransition.None },
+            exitTransition = { ExitTransition.None },
+            popEnterTransition = { EnterTransition.None },
+            popExitTransition = { ExitTransition.None }
         )
          {
             composable("main_settings") {
@@ -228,7 +230,8 @@ fun MainAppContainer() {
             }
             composable("ambient_settings_screen") {
                 AmbientSettingsScreen(
-                    onBack = { navController.popBackStack() }
+                    onBack = { navController.popBackStack() },
+                    onOpenPositions = { showPositionSettings = true }
                 )
             }
         }
@@ -241,10 +244,20 @@ fun MainAppContainer() {
                 onClose = { isMenuOpen = false },
                 onNavigate = { route ->
                     isMenuOpen = false  // ✅ Close BEFORE navigating
-                    navController.navigate(route) {
-                        launchSingleTop = true
+                    if (route == "position_settings_screen") {
+                        showPositionSettings = true
+                    } else {
+                        navController.navigate(route) {
+                            launchSingleTop = true
+                        }
                     }
                 }
+            )
+        }
+
+        if (showPositionSettings) {
+            PositionSettingsScreen(
+                onBack = { showPositionSettings = false }
             )
         }
     }
@@ -429,7 +442,10 @@ fun SideMenuOverlay(visible: Boolean, onClose: () -> Unit, content: @Composable 
     }
 }
 @Composable
-fun SideMenuDrawer(onClose: () -> Unit,onNavigate: (String) -> Unit) {
+fun SideMenuDrawer(onClose: () -> Unit, onNavigate: (String) -> Unit) {
+    val context = LocalContext.current
+    var showAbout by remember { mutableStateOf(false) }
+
     Surface(
         modifier = Modifier
             .fillMaxWidth()
@@ -475,14 +491,96 @@ fun SideMenuDrawer(onClose: () -> Unit,onNavigate: (String) -> Unit) {
                 SideMenuItem("Ambient Display", R.drawable.amb) {
                     onNavigate("ambient_settings_screen")
                 }
-                SideMenuItem("Battery Optimization", R.drawable.battery)
-                SideMenuItem("Rate App", R.drawable.rate)
-                SideMenuItem("About Us", R.drawable.about)
+                SideMenuItem("Element Positions", R.drawable.amb) {
+                    onNavigate("position_settings_screen")
+                }
+                SideMenuItem("Battery Optimization", R.drawable.battery) {
+                    openBatteryOptimization(context)
+                    onClose()
+                }
+                SideMenuItem("Rate App", R.drawable.rate) {
+                    openPlayStore(context)
+                    onClose()
+                }
+                SideMenuItem("About Us", R.drawable.about) {
+                    showAbout = true
+                }
 
             }
 
         }
 
+    }
+
+    if (showAbout) {
+        AlertDialog(
+            onDismissRequest = { showAbout = false },
+            containerColor = Color(0xFF1E1E1E),
+            titleContentColor = Color.White,
+            textContentColor = Color.White.copy(0.8f),
+            title = { Text("About HKAOD") },
+            text = {
+                Column {
+                    Text("Always-On Display with gesture based wake for Android.")
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text("Version ${appVersionName(context)}")
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text("Made with \u2764\uFE0F by HK Tamizhan")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showAbout = false }) {
+                    Text("OK", color = HKAOD_Red)
+                }
+            }
+        )
+    }
+}
+
+private fun appVersionName(context: Context): String = try {
+    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "1.0"
+} catch (_: Exception) {
+    "1.0"
+}
+
+fun isIgnoringBatteryOptimizations(context: Context): Boolean = try {
+    val pm = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+    pm.isIgnoringBatteryOptimizations(context.packageName)
+} catch (_: Exception) {
+    false
+}
+
+private fun openBatteryOptimization(context: Context) {
+    try {
+        context.startActivity(
+            Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    } catch (_: Exception) {
+        try {
+            context.startActivity(
+                Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (_: Exception) {
+        }
+    }
+}
+
+private fun openPlayStore(context: Context) {
+    val pkg = context.packageName
+    try {
+        context.startActivity(
+            Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=$pkg"))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    } catch (_: Exception) {
+        try {
+            context.startActivity(
+                Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=$pkg"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (_: Exception) {
+        }
     }
 }
 @Composable
@@ -644,6 +742,43 @@ fun WelcomeScreen(onNextClick: () -> Unit) {
 @Composable
 fun NotificationRequestScreen(onNextClick: () -> Unit) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val lifecycleState by lifecycleOwner.lifecycle.currentStateAsState()
+    // True once the user has actually been sent to the listener settings page,
+    // so returning from it can auto-advance when access was granted.
+    var openedSettings by remember { mutableStateOf(false) }
+
+    fun openListenerSettings() {
+        try {
+            val notificationIntent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+            notificationIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            openedSettings = true
+            context.startActivity(notificationIntent)
+        } catch (_: Exception) {
+        }
+    }
+
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (!isGranted) {
+            Toast.makeText(context, "Notification permission denied", Toast.LENGTH_SHORT).show()
+        }
+        // The runtime dialog is dismissed — now open the listener settings.
+        openListenerSettings()
+    }
+
+    // Returning from the notification-listener settings page with access
+    // granted continues the onboarding automatically (no double tap needed).
+    LaunchedEffect(lifecycleState) {
+        if (lifecycleState == Lifecycle.State.RESUMED &&
+            openedSettings &&
+            notificationListenerEnabled(context)
+        ) {
+            onNextClick()
+        }
+    }
+
     // 1. Lottie for Notification (Example: A ringing bell or message bubble)
     val composition by rememberLottieComposition(LottieCompositionSpec.RawRes(R.raw.notifications))
     val progress by animateLottieCompositionAsState(
@@ -651,23 +786,6 @@ fun NotificationRequestScreen(onNextClick: () -> Unit) {
         iterations = LottieConstants.IterateForever,
         speed = 0.7f
     )
-    val launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        if (!isGranted) {
-            Toast.makeText(context, "Notification permission denied", Toast.LENGTH_SHORT).show()
-        }
-        // The core step for this screen is enabling notification *listener*
-        // access so the AOD can read incoming notifications. Open that page
-        // after the runtime dialog is dismissed (not on top of it), then advance.
-        try {
-            val notificationIntent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
-            notificationIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
-            context.startActivity(notificationIntent)
-        } catch (_: Exception) {
-        }
-        onNextClick()
-    }
 
     Column(
         modifier = Modifier.fillMaxSize().padding(24.dp),
@@ -705,18 +823,20 @@ fun NotificationRequestScreen(onNextClick: () -> Unit) {
         // 4. PERMISSION BUTTON
         Button(
             onClick = {
-                // On Android 13+ ask for POST_NOTIFICATIONS first; the listener
-                // settings page is then opened from the permission-result callback.
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                } else {
-                    try {
-                        val notificationIntent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
-                        notificationIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                        context.startActivity(notificationIntent)
-                    } catch (_: Exception) {
+                when {
+                    // Already have listener access — just continue.
+                    notificationListenerEnabled(context) -> onNextClick()
+                    // Android 13+: ask for POST_NOTIFICATIONS first; the
+                    // listener settings page opens from the result callback.
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                        ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.POST_NOTIFICATIONS
+                        ) != PackageManager.PERMISSION_GRANTED -> {
+                        launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
                     }
-                    onNextClick()
+                    // Otherwise open the listener settings directly.
+                    else -> openListenerSettings()
                 }
             },
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEC6666)),
@@ -754,6 +874,11 @@ private fun queryDisplayName(context: Context, uri: Uri): String? {
     } catch (e: Exception) {
         null
     }
+}
+
+fun notificationListenerEnabled(context: Context): Boolean {
+    return NotificationManagerCompat.getEnabledListenerPackages(context)
+        .contains(context.packageName)
 }
 
 fun isAccessibilityServiceEnabled(context: Context): Boolean {
@@ -901,9 +1026,18 @@ fun BatteryOptimizationScreen(onNextClick: () -> Unit) {
 
         Button(
             onClick = {
-                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                    data = Uri.parse("package:${context.packageName}")}
-                context.startActivity(intent)
+                if (!isIgnoringBatteryOptimizations(context)) {
+                    try {
+                        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                            data = Uri.parse("package:${context.packageName}")
+                        }
+                        context.startActivity(intent)
+                    } catch (_: Exception) {
+                        // Some OEMs/enterprise devices refuse the dialog — fall
+                        // back to the plain battery-optimization settings list.
+                        openBatteryOptimization(context)
+                    }
+                }
                 onNextClick()
             },
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEC6666)),
@@ -1078,13 +1212,15 @@ fun FeatureSettingsScreen(
 }
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AmbientSettingsScreen(onBack: () -> Unit) {
+fun AmbientSettingsScreen(
+    onBack: () -> Unit,
+    onOpenPositions: () -> Unit
+) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("HKAOD_PREFS", Context.MODE_PRIVATE) }
     var showWatts by remember { mutableStateOf(prefs.getBoolean("charging_show_watts", true)) }
     var showClockPicker by remember { mutableStateOf(false) }
     val currentStyle by ClockStyleRepository.style.collectAsState()
-    val currentSize by ClockStyleRepository.size.collectAsState()
     val customFont by ClockStyleRepository.customFont.collectAsState()
     val useCustomFont by ClockStyleRepository.useCustomFont.collectAsState()
     val customFontName by ClockStyleRepository.customFontName.collectAsState()
@@ -1113,10 +1249,13 @@ fun AmbientSettingsScreen(onBack: () -> Unit) {
     var chargingSpeed by remember { mutableStateOf(prefs.getBoolean("ambient_charging_speed", false)) }
     var notificationIntel by remember { mutableStateOf(prefs.getBoolean("ambient_notification_intel", false)) }
     var callIntel by remember { mutableStateOf(prefs.getBoolean("ambient_call_intel", false)) }
+    var clockSize by remember { mutableFloatStateOf(prefs.getFloat("clock_size", 80f)) }
+    var tapToShow by remember { mutableStateOf(prefs.getBoolean("ambient_tap_to_show", false)) }
+    var tapSensitivity by remember { mutableIntStateOf(prefs.getInt("tap_sensitivity", 100)) }
+    var aodTimeout by remember { mutableIntStateOf(prefs.getInt("aod_timeout_seconds", 10)) }
     LaunchedEffect(Unit) {
-        val savedSize = prefs.getFloat("clock_size", 80f)
-        ClockStyleRepository.setSize(savedSize)
-        ClockStyleRepository.loadPersistedCustomFont(context)
+        // Restores style, size and custom font from prefs.
+        ClockStyleRepository.loadFromPrefs(context)
     }
 
     Column(
@@ -1192,10 +1331,9 @@ fun AmbientSettingsScreen(onBack: () -> Unit) {
                                         indication = null,
                                         interactionSource = remember { MutableInteractionSource() }
                                     ) {
-                                        // Selecting a preset turns the custom font off (and
-                                        // persists that so it survives a restart).
-                                        prefs.edit().putBoolean("clock_use_custom", false).apply()
-                                        ClockStyleRepository.setStyle(style)
+                                        // Persistently select the preset; this also
+                                        // switches the custom font off.
+                                        ClockStyleRepository.setStyle(context, style)
                                         showClockPicker = false
                                     },
                                 shape = RoundedCornerShape(16.dp),
@@ -1233,6 +1371,115 @@ fun AmbientSettingsScreen(onBack: () -> Unit) {
                             }
                         }
                     }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // ── Tap to Show ──
+            AmbientToggleCard(
+                label = "Tap to Show",
+                subtitle = "Single-tap the sleeping screen to show the AOD. Double-tap keeps the normal system behaviour — it wakes to the lock screen. Slight battery cost: the tap is sensed while the screen stays off.",
+                checked = tapToShow,
+                onCheckedChange = {
+                    tapToShow = it
+                    prefs.edit().putBoolean("ambient_tap_to_show", it).apply()
+                }
+            )
+
+            // ── Tap Sensitivity (only relevant for Tap to Show) ──
+            if (tapToShow) {
+                Spacer(modifier = Modifier.height(12.dp))
+                AmbientCard {
+                    Column(modifier = Modifier.padding(20.dp)) {
+                        Text("Tap Sensitivity", color = Color.White, fontSize = 16.sp)
+                        Text(
+                            text = "How firmly the sleeping screen must be tapped. Lower it if the AOD wakes on its own; raise it if taps are missed.",
+                            color = Color.White.copy(0.6f),
+                            fontSize = 12.sp
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "$tapSensitivity%",
+                            color = Color.White.copy(0.6f),
+                            fontSize = 12.sp
+                        )
+                        Slider(
+                            value = tapSensitivity.toFloat(),
+                            onValueChange = {
+                                val snapped = ((it / 10f).roundToInt() * 10).coerceIn(50, 200)
+                                tapSensitivity = snapped
+                                prefs.edit().putInt("tap_sensitivity", snapped).apply()
+                            },
+                            valueRange = 50f..200f,
+                            steps = 14,
+                            colors = SliderDefaults.colors(
+                                thumbColor = HKAOD_Red,
+                                activeTrackColor = HKAOD_Red
+                            )
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // ── AOD Timeout ──
+            AmbientCard {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Text("AOD Timeout", color = Color.White, fontSize = 16.sp)
+                    Text(
+                        text = "How long the AOD stays visible before the screen turns back off. If \"Always-On Ambient\" is enabled, the AOD never times out.",
+                        color = Color.White.copy(0.6f),
+                        fontSize = 12.sp
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "$aodTimeout s",
+                        color = Color.White.copy(0.6f),
+                        fontSize = 12.sp
+                    )
+                    Slider(
+                        value = aodTimeout.toFloat(),
+                        onValueChange = {
+                            val snapped = ((it / 5f).roundToInt() * 5).coerceIn(5, 60)
+                            aodTimeout = snapped
+                            prefs.edit().putInt("aod_timeout_seconds", snapped).apply()
+                        },
+                        valueRange = 5f..60f,
+                        steps = 10,
+                        colors = SliderDefaults.colors(
+                            thumbColor = HKAOD_Red,
+                            activeTrackColor = HKAOD_Red
+                        )
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // ── Clock size ──
+            AmbientCard {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Text("Clock Size", color = Color.White, fontSize = 16.sp)
+                    Text(
+                        text = "${clockSize.roundToInt()} sp",
+                        color = Color.White.copy(0.6f),
+                        fontSize = 12.sp
+                    )
+                    Slider(
+                        value = clockSize,
+                        onValueChange = {
+                            val snapped = (it / 2f).roundToInt() * 2f
+                            clockSize = snapped
+                            ClockStyleRepository.setSize(context, snapped)
+                        },
+                        valueRange = 40f..140f,
+                        colors = SliderDefaults.colors(
+                            thumbColor = HKAOD_Red,
+                            activeTrackColor = HKAOD_Red
+                        )
+                    )
                 }
             }
 
@@ -1322,64 +1569,19 @@ fun AmbientSettingsScreen(onBack: () -> Unit) {
             Spacer(modifier = Modifier.height(12.dp))
 
             AmbientCard {
-                Column(modifier = Modifier.padding(20.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Clock Size", color = Color.White, fontSize = 16.sp)
-                        Text(
-                            text = when {
-                                currentSize < 50f  -> "XS"
-                                currentSize < 65f  -> "S"
-                                currentSize < 80f  -> "M"
-                                currentSize < 95f  -> "L"
-                                else               -> "XL"
-                            },
-                            color    = HKAOD_Red,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Text(
-                        text       = "12:00",
-                        color      = Color.White,
-                        fontSize   = currentSize.sp,
-                        fontFamily = if (useCustomFont && customFont != null) customFont!!
-                                     else ClockStyleRepository.fontFamilyFor(currentStyle),
-                        fontWeight    = FontWeight.Thin,
-                        modifier      = Modifier.fillMaxWidth(),
-                        textAlign     = TextAlign.Center,
-                        letterSpacing = 2.sp
-                    )
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    Slider(
-                        value         = currentSize,
-                        onValueChange = {
-                            ClockStyleRepository.setSize(it)
-                            prefs.edit().putFloat("clock_size", it).apply()
-                        },
-                        valueRange    = 40f..120f,
-                        modifier      = Modifier.fillMaxWidth(),
-                        colors        = SliderDefaults.colors(
-                            thumbColor         = HKAOD_Red,
-                            activeTrackColor   = HKAOD_Red,
-                            inactiveTrackColor = Color.White.copy(0.2f)
-                        )
-                    )
-
-                    Row(
-                        modifier              = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text("40", color = Color.White.copy(0.4f), fontSize = 11.sp)
-                        Text("120", color = Color.White.copy(0.4f), fontSize = 11.sp)
-                    }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(20.dp)
+                        .clickable(
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() }
+                        ) { onOpenPositions() },
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Element Positions", color = Color.White, fontSize = 16.sp)
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = Color.White)
                 }
             }
 
@@ -1531,7 +1733,8 @@ fun AmbientCard(content: @Composable () -> Unit) {
 fun AmbientToggleCard(
     label: String,
     checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
+    onCheckedChange: (Boolean) -> Unit,
+    subtitle: String? = null
 ) {
     AmbientCard {
         Row(
@@ -1541,7 +1744,14 @@ fun AmbientToggleCard(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(label, color = Color.White, fontSize = 16.sp)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(label, color = Color.White, fontSize = 16.sp)
+                if (subtitle != null) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(subtitle, color = Color.White.copy(0.6f), fontSize = 12.sp)
+                }
+            }
+            Spacer(modifier = Modifier.width(12.dp))
             Switch(
                 checked = checked,
                 onCheckedChange = onCheckedChange,
@@ -1555,4 +1765,535 @@ fun AmbientToggleCard(
             )
         }
     }
+}
+
+@Composable
+fun PositionSettingsScreen(onBack: () -> Unit) {
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences(AODPositions.PREFS_NAME, Context.MODE_PRIVATE) }
+
+    var positions by remember {
+        mutableStateOf(AODPositions.Elements.associateWith { AODPositions.read(prefs, it) })
+    }
+    var selected by remember { mutableStateOf("clock") }
+    var previewTime by remember { mutableStateOf("12:00") }
+
+    LaunchedEffect(Unit) {
+        val use24 = prefs.getBoolean("time_format_24", false)
+        val fmt = SimpleDateFormat(if (use24) "HH:mm" else "hh:mm", Locale.getDefault())
+        while (true) {
+            previewTime = fmt.format(Calendar.getInstance().time)
+            delay(1000L)
+        }
+    }
+
+    fun update(element: String, persist: Boolean = true, transform: (AODPosition) -> AODPosition) {
+        val current = positions[element] ?: return
+        val updated = transform(current).let {
+            it.copy(
+                x = it.x.coerceIn(0f, 1f),
+                y = it.y.coerceIn(0f, 1f),
+                scale = it.scale.coerceIn(0.4f, 2.5f)
+            )
+        }
+        positions = positions + (element to updated)
+        // Dragging emits dozens of updates per second — persist those only on
+        // drag end to avoid hammering SharedPreferences.
+        if (persist) AODPositions.save(prefs, element, updated)
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .statusBarsPadding()
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp)
+        ) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.Default.KeyboardArrowLeft, null, tint = Color.White)
+            }
+            Text(
+                "Element Positions",
+                color = Color.White,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.weight(1f)
+            )
+            TextButton(onClick = {
+                positions = AODPositions.Elements.associateWith {
+                    AODPositions.Defaults.getValue(it)
+                }
+                AODPositions.Elements.forEach { AODPositions.save(prefs, it, positions.getValue(it)) }
+            }) {
+                Text("Reset All", color = HKAOD_Red, fontSize = 14.sp)
+            }
+        }
+
+        PreviewBox(
+            modifier = Modifier.weight(1f),
+            positions = positions,
+            selected = selected,
+            previewTime = previewTime,
+            onElementDrag = { element, x, y ->
+                update(element, persist = false) { it.copy(x = x, y = y) }
+            },
+            onElementDragEnd = { element ->
+                positions[element]?.let { AODPositions.save(prefs, element, it) }
+            }
+        )
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        PositionControlsPanel(
+            positions = positions,
+            selected = selected,
+            onSelect = { selected = it },
+            onScaleChange = { element, scale -> update(element) { it.copy(scale = scale) } },
+            onVisibleChange = { element, visible -> update(element) { it.copy(visible = visible) } },
+            onAlignChange = { element, align -> update(element) { it.copy(align = align) } },
+            onResetElement = { element ->
+                val def = AODPositions.Defaults[element]
+                if (def != null) update(element) { def.copy() }
+            }
+        )
+    }
+}
+
+@Composable
+private fun PreviewBox(
+    modifier: Modifier = Modifier,
+    positions: Map<String, AODPosition>,
+    selected: String,
+    previewTime: String,
+    onElementDrag: (String, Float, Float) -> Unit,
+    onElementDragEnd: (String) -> Unit
+) {
+    var container by remember { mutableStateOf(IntSize.Zero) }
+    var snapX by remember { mutableStateOf(false) }
+    var snapY by remember { mutableStateOf(false) }
+
+    // Match the real device's aspect ratio so fractions map 1:1 to the AOD screen.
+    val config = LocalConfiguration.current
+    val deviceRatio = config.screenHeightDp.toFloat() / config.screenWidthDp.toFloat()
+
+    // Measure the available area on a plain Box so the phone frame below can be
+    // fitted to the device aspect ratio (no BoxWithConstraints needed).
+    var parentPx by remember { mutableStateOf(IntSize(360, 720)) }
+    val density = LocalDensity.current
+    val (parentWdp, parentHdp) = with(density) {
+        parentPx.width.toDp() to parentPx.height.toDp()
+    }
+    val phoneW = minOf(parentWdp, parentHdp / deviceRatio)
+    val phoneH = phoneW * deviceRatio
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp)
+            .onSizeChanged { parentPx = it }
+    ) {
+        Box(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .size(width = phoneW, height = phoneH)
+                .clip(RoundedCornerShape(24.dp))
+                .background(Color(0xFF0A0A0A))
+                .border(1.dp, Color.White.copy(0.15f), RoundedCornerShape(24.dp))
+                .onSizeChanged { container = it }
+        ) {
+            Text(
+                "Drag elements to position them",
+                color = Color.White.copy(0.22f),
+                fontSize = 11.sp,
+                modifier = Modifier.align(Alignment.Center)
+            )
+
+            AODPositions.Elements.forEach { element ->
+                val pos = positions[element] ?: return@forEach
+                if (pos.visible) {
+                    DraggablePreviewElement(
+                        element = element,
+                        pos = pos,
+                        containerPx = container,
+                        isSelected = element == selected,
+                        previewTime = previewTime,
+                        onDrag = { x, y, sx, sy ->
+                            snapX = sx
+                            snapY = sy
+                            onElementDrag(element, x, y)
+                        },
+                        onDragEnd = {
+                            snapX = false
+                            snapY = false
+                            onElementDragEnd(element)
+                        }
+                    )
+                }
+            }
+
+            // Center snap guides (shown while snapping to the axis).
+            if (snapX) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .width(1.5.dp)
+                        .fillMaxHeight()
+                        .background(HKAOD_Red.copy(alpha = 0.85f))
+                )
+            }
+            if (snapY) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .height(1.5.dp)
+                        .fillMaxWidth()
+                        .background(HKAOD_Red.copy(alpha = 0.85f))
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun DraggablePreviewElement(
+    element: String,
+    pos: AODPosition,
+    containerPx: IntSize,
+    isSelected: Boolean,
+    previewTime: String,
+    onDrag: (Float, Float, Boolean, Boolean) -> Unit,
+    onDragEnd: () -> Unit
+) {
+    val currentPos by rememberUpdatedState(pos)
+    val widthPx  by rememberUpdatedState(containerPx.width.coerceAtLeast(1))
+    val heightPx by rememberUpdatedState(containerPx.height.coerceAtLeast(1))
+    var elemSize by remember { mutableStateOf(IntSize.Zero) }
+
+    Box(
+        modifier = Modifier
+            .wrapContentSize()
+            .onSizeChanged { elemSize = it }
+            .offset {
+                IntOffset(
+                    (pos.x * containerPx.width - elemSize.width / 2f).roundToInt(),
+                    (pos.y * containerPx.height - elemSize.height / 2f).roundToInt()
+                )
+            }
+            .graphicsLayer {
+                val s = pos.scale
+                scaleX = s
+                scaleY = s
+                transformOrigin = TransformOrigin(0.5f, 0.5f)
+            }
+            .pointerInput(element) {
+                detectDragGestures(
+                    onDrag = { change, dragAmount ->
+                        change.consume()
+                        // x/y is the element's CENTER — scale-invariant, so snapping
+                        // the anchor to 0.5 centres the element at any size.
+                        var newX = currentPos.x + dragAmount.x / widthPx
+                        var newY = currentPos.y + dragAmount.y / heightPx
+
+                        val snapPx = 10f
+                        val snapX  = abs(newX - 0.5f) * widthPx < snapPx
+                        val snapY  = abs(newY - 0.5f) * heightPx < snapPx
+                        if (snapX) newX = 0.5f
+                        if (snapY) newY = 0.5f
+
+                        onDrag(
+                            newX.coerceIn(0f, 1f),
+                            newY.coerceIn(0f, 1f),
+                            snapX,
+                            snapY
+                        )
+                    },
+                    onDragEnd = { onDragEnd() },
+                    onDragCancel = { onDragEnd() }
+                )
+            }
+    ) {
+        PreviewElementContent(element, previewTime, pos.align)
+
+        if (isSelected) {
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .border(1.5.dp, HKAOD_Red, RoundedCornerShape(6.dp))
+            )
+        }
+    }
+}
+
+@Composable
+private fun PreviewElementContent(element: String, previewTime: String, align: String) {
+    val textAlign = aodTextAlign(align)
+    val hAlignment = when (align) {
+        "start" -> Arrangement.Start
+        "end"   -> Arrangement.End
+        else    -> Arrangement.Center
+    }
+
+    when (element) {
+        "clock" -> Text(
+            text = previewTime,
+            color = Color.White,
+            fontSize = 72.sp,
+            fontWeight = FontWeight.Thin,
+            letterSpacing = 4.sp
+        )
+        "date" -> Text(
+            text = "Mon, 09 September",
+            color = Color.White,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Bold
+        )
+        "notifications" -> Column(Modifier.width(IntrinsicSize.Min)) {
+            NotificationPreviewLine("New message from Anbu", textAlign)
+            Spacer(Modifier.height(6.dp))
+            NotificationPreviewLine("2 missed calls from Appa", textAlign)
+        }
+        "media" -> Column(
+            modifier = Modifier.width(IntrinsicSize.Min),
+            horizontalAlignment = when (align) {
+                "start" -> Alignment.Start
+                "end"   -> Alignment.End
+                else    -> Alignment.CenterHorizontally
+            }
+        ) {
+            Text(
+                "Currently Playing · Song",
+                color = Color.White,
+                fontSize = 13.sp,
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = textAlign
+            )
+            Spacer(Modifier.height(6.dp))
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(Color.White.copy(0.4f))
+            )
+        }
+        else -> Column(
+            modifier = Modifier.width(IntrinsicSize.Min),
+            horizontalAlignment = when (align) {
+                "start" -> Alignment.Start
+                "end"   -> Alignment.End
+                else    -> Alignment.CenterHorizontally
+            }
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = hAlignment,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Default.BatteryFull, null, tint = Color.White)
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "85% · Charging",
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "32 min until full",
+                color = Color.White.copy(0.7f),
+                fontSize = 15.sp,
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = textAlign
+            )
+        }
+    }
+}
+
+@Composable
+private fun NotificationPreviewLine(text: String, textAlign: TextAlign = TextAlign.Start) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            Icons.Default.Notifications,
+            null,
+            tint = Color.White,
+            modifier = Modifier.size(16.dp)
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text,
+            color = Color.White,
+            fontSize = 13.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+            textAlign = textAlign
+        )
+    }
+}
+
+@Composable
+private fun PositionControlsPanel(
+    positions: Map<String, AODPosition>,
+    selected: String,
+    onSelect: (String) -> Unit,
+    onScaleChange: (String, Float) -> Unit,
+    onVisibleChange: (String, Boolean) -> Unit,
+    onAlignChange: (String, String) -> Unit,
+    onResetElement: (String) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            AODPositions.Elements.forEach { element ->
+                val pos = positions[element] ?: return@forEach
+                ElementChip(
+                    label = elementLabel(element),
+                    selected = element == selected,
+                    visible = pos.visible,
+                    onClick = { onSelect(element) }
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        val selPos = positions[selected] ?: return
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Scale ${String.format(Locale.US, "%.1f", selPos.scale)}x",
+                color = Color.White,
+                fontSize = 13.sp,
+                modifier = Modifier.weight(1f)
+            )
+            TextButton(onClick = { onResetElement(selected) }) {
+                Text("Reset", color = HKAOD_Red, fontSize = 13.sp)
+            }
+        }
+        Slider(
+            value = selPos.scale,
+            onValueChange = { onScaleChange(selected, it) },
+            valueRange = 0.4f..2.5f,
+            colors = SliderDefaults.colors(
+                thumbColor = HKAOD_Red,
+                activeTrackColor = HKAOD_Red,
+                inactiveTrackColor = Color.White.copy(0.2f)
+            )
+        )
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Alignment",
+                color = Color.White.copy(0.7f),
+                fontSize = 13.sp,
+                modifier = Modifier.weight(1f)
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                AODPositions.Alignments.forEach { align ->
+                    AlignChip(
+                        label = when (align) {
+                            "start" -> "Left"
+                            "end"   -> "Right"
+                            else    -> "Center"
+                        },
+                        selected = selPos.align == align,
+                        onClick = { onAlignChange(selected, align) }
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Show on AOD",
+                color = Color.White,
+                fontSize = 14.sp,
+                modifier = Modifier.weight(1f)
+            )
+            Switch(
+                checked = selPos.visible,
+                onCheckedChange = { onVisibleChange(selected, it) },
+                colors = SwitchDefaults.colors(checkedThumbColor = Color(0xFFEC6666))
+            )
+        }
+    }
+}
+
+@Composable
+private fun AlignChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    Surface(
+        modifier = Modifier
+            .height(30.dp)
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(15.dp),
+        color = if (selected) HKAOD_Red else Color.White.copy(0.08f),
+        border = BorderStroke(1.dp, if (selected) HKAOD_Red else Color.White.copy(0.15f))
+    ) {
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(horizontal = 14.dp)) {
+            Text(
+                text = label,
+                color = Color.White,
+                fontSize = 12.sp,
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+            )
+        }
+    }
+}
+
+@Composable
+private fun ElementChip(
+    label: String,
+    selected: Boolean,
+    visible: Boolean,
+    onClick: () -> Unit
+) {
+    Surface(
+        modifier = Modifier
+            .height(34.dp)
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(17.dp),
+        color = if (selected) HKAOD_Red else Color.White.copy(if (visible) 0.10f else 0.05f),
+        border = BorderStroke(1.dp, if (selected) HKAOD_Red else Color.White.copy(0.15f))
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier.padding(horizontal = 16.dp)
+        ) {
+            Text(
+                text = label,
+                color = if (visible) Color.White else Color.White.copy(0.4f),
+                fontSize = 13.sp,
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+            )
+        }
+    }
+}
+
+private fun elementLabel(element: String): String = when (element) {
+    "clock" -> "Clock"
+    "date" -> "Date"
+    "notifications" -> "Notifications"
+    "media" -> "Media"
+    else -> "Charging"
 }

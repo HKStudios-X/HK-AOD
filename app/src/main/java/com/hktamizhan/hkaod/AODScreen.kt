@@ -17,6 +17,8 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.util.Log
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
@@ -44,15 +46,21 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.changedToDown
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
@@ -65,9 +73,12 @@ import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.math.abs
-import kotlin.math.sqrt
+import kotlin.math.roundToInt
 @Composable
-fun AODScreen() {
+fun AODScreen(
+    onDismiss: () -> Unit = { AODService.getService()?.removeAODOverlay() },
+    onInteraction: () -> Unit = {}
+) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("HKAOD_PREFS", Context.MODE_PRIVATE) }
     val fadeAlpha    = remember { Animatable(1f) }
@@ -79,17 +90,15 @@ fun AODScreen() {
                 animationSpec = tween(400, easing = FastOutSlowInEasing)
             )
             delay(80L)
-            AODService.getService()?.removeAODOverlay()
+            onDismiss()
         }
     }
-    var firstTapOffset  by remember { mutableStateOf(Offset.Zero) }
-    var firstTapTime    by remember { mutableLongStateOf(0L) }
-    val doubleTapRadius = 60f
-    val doubleTapTimeout = 600L
     var showNotifications by remember { mutableStateOf(prefs.getBoolean("ambient_notifications", false)) }
     var showMediaIntel    by remember { mutableStateOf(prefs.getBoolean("ambient_media_intel", false)) }
+    var showMediaControls by remember { mutableStateOf(prefs.getBoolean("ambient_media_controls", false)) }
     var showCharging      by remember { mutableStateOf(prefs.getBoolean("ambient_charging_speed", false)) }
     var showNotifIntel    by remember { mutableStateOf(prefs.getBoolean("ambient_notification_intel", false)) }
+    var showCallIntel     by remember { mutableStateOf(prefs.getBoolean("ambient_call_intel", false)) }
     var is24Hour          by remember { mutableStateOf(prefs.getBoolean("time_format_24", false)) }
 
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -98,8 +107,10 @@ fun AODScreen() {
         if (lifecycleState == Lifecycle.State.RESUMED) {
             showNotifications = prefs.getBoolean("ambient_notifications", false)
             showMediaIntel    = prefs.getBoolean("ambient_media_intel", false)
+            showMediaControls = prefs.getBoolean("ambient_media_controls", false)
             showCharging      = prefs.getBoolean("ambient_charging_speed", false)
             showNotifIntel    = prefs.getBoolean("ambient_notification_intel", false)
+            showCallIntel     = prefs.getBoolean("ambient_call_intel", false)
             is24Hour          = prefs.getBoolean("time_format_24", false)
         }
     }
@@ -109,8 +120,7 @@ fun AODScreen() {
     val useCustomFont by ClockStyleRepository.useCustomFont.collectAsState()
     val clockFontFamily = if (useCustomFont && customFont != null) customFont!!
                           else ClockStyleRepository.fontFamilyFor(clockStyle)
-    // Restore an imported font after a cold start (overlay runs in the service process).
-    LaunchedEffect(Unit) { ClockStyleRepository.loadPersistedCustomFont(context) }
+    LaunchedEffect(Unit) { ClockStyleRepository.loadFromPrefs(context) }
     var currentTime by remember { mutableStateOf("") }
     var currentDate by remember { mutableStateOf("") }
     LaunchedEffect(is24Hour) {
@@ -123,6 +133,14 @@ fun AODScreen() {
             delay(1000L)
         }
     }
+
+    // Element positions (x/y fractions, scale, visibility)
+    val clockPos    = AODPositions.read(prefs, "clock")
+    val datePos     = AODPositions.read(prefs, "date")
+    val notifPos    = AODPositions.read(prefs, "notifications")
+    val mediaPos    = AODPositions.read(prefs, "media")
+    val chargingPos = AODPositions.read(prefs, "charging")
+    var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var isCharging      by remember { mutableStateOf(false) }
     var chargingWatts   by remember { mutableStateOf("") }
     var chargingLabel   by remember { mutableStateOf("") }
@@ -147,6 +165,13 @@ fun AODScreen() {
         context.registerReceiver(receiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         onDispose { context.unregisterReceiver(receiver) }
     }
+    // Coulometer state for the delta-current fallback on devices that don't
+    // expose CURRENT_NOW / CURRENT_AVERAGE.
+    var prevCounter by remember { mutableStateOf(0L) }
+    var prevCounterTime by remember { mutableStateOf(0L) }
+    // Debug: log charging readings only when they change (avoids log spam).
+    var lastChargeSig by remember { mutableStateOf("") }
+
     // Dynamic battery/charging poll — refreshes the live rate (W / mA), the
     // charging label, the charge ETA and the discharge estimate every second.
     LaunchedEffect(Unit) {
@@ -159,7 +184,7 @@ fun AODScreen() {
                 val scale   = sticky?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
                 val status  = sticky?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
                 val plugged = sticky?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) ?: -1
-                val voltage = sticky?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0) ?: 0  // mV
+                var voltage = sticky?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0) ?: 0  // mV
 
                 val pct = if (scale > 0) level * 100 / scale else batteryLevel
                 batteryLevel = pct
@@ -167,45 +192,86 @@ fun AODScreen() {
                         status == BatteryManager.BATTERY_STATUS_FULL
                 isCharging = charging
 
-                // Live instantaneous current — read every tick so the rate is dynamic.
-                val currentMicroA = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
-                val currentMagA   = abs(currentMicroA)
-                val currentA      = currentMagA / 1_000_000f
-                val voltageV      = if (voltage > 0) voltage / 1000f else 0f
-                val watts         = currentA * voltageV
-                val currentMA     = currentMagA / 1000f          // µA → mA
-                val showWatts     = prefs.getBoolean("charging_show_watts", true)
+                // ── Live current (mA) ──
+                // CURRENT_NOW's sign convention differs across OEMs (some
+                // report positive while charging, others negative) and it can
+                // be 0 on devices that don't expose it. Normalise to a
+                // positive magnitude, then fall back to CURRENT_AVERAGE and
+                // finally to charge-counter deltas.
+                var currentMA = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW) / 1000f
+                if (abs(currentMA) < 50f) {
+                    val avg = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE) / 1000f
+                    if (abs(avg) >= 50f) currentMA = avg
+                }
+
+                val now = System.currentTimeMillis()
+                val chargeCounter = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER).toLong()
+                if (abs(currentMA) < 50f && chargeCounter > 0 && prevCounter > 0) {
+                    val dt = now - prevCounterTime
+                    if (dt in 300L..30_000L) {
+                        // µAh over dt ms → µA: ×3.6e6 / dt  (1 µAh = 3.6e6 µA·ms)
+                        val estUa = (chargeCounter - prevCounter) * 3_600_000L / dt
+                        val estMA = abs(estUa) / 1000f
+                        if (estMA in 50f..10_000f) currentMA = estMA
+                    }
+                }
+                prevCounter     = chargeCounter
+                prevCounterTime = now
+
+                // Sensor magnitude — meaningful for both charging and discharging.
+                val liveMA    = abs(currentMA)
+                val saneRate  = liveMA in 50f..10_000f        // ignore nonsense sensor reads
+                val showWatts = prefs.getBoolean("charging_show_watts", true)
+
+                // Battery-side voltage. A few devices report no EXTRA_VOLTAGE —
+                // fall back to a typical charging voltage so watts still show.
+                if (voltage <= 0 && saneRate) voltage = 4000
+                val voltageV  = if (voltage > 0) voltage / 1000f else 0f
+
+                // Android has no public API for the system's negotiated charger
+                // rate or a system-provided "time until full", so the wattage
+                // and ETA are derived from the live current above.
+                val wattValue = if (saneRate) liveMA * voltageV / 1000f else 0f
 
                 if (charging) {
                     chargingWatts = when {
-                        showWatts && watts > 0.1f    -> "%.1f W".format(watts)
-                        !showWatts && currentMA > 0f -> "%.0f mA".format(currentMA)
-                        else                         -> ""
+                        !saneRate        -> ""
+                        showWatts        -> "%.1f W".format(wattValue)
+                        else             -> "%.0f mA".format(liveMA)
                     }
+                    // Charger-side wattage is not exposed by any public API, and
+                    // battery watts are always lower than the charger's rating
+                    // (an 18W charger puts ~4A ≈ 14W into the battery). The
+                    // current actually flowing into the battery is the most
+                    // consistent cross-device signal for the charge speed.
                     chargingLabel = when {
                         plugged == BatteryManager.BATTERY_PLUGGED_WIRELESS -> "Wireless Charging"
-                        watts >= 45f -> "Super Fast Charging"
-                        watts >= 25f -> "Fast Charging"
-                        watts >= 10f -> "Charging"
-                        else         -> "Slow Charging"
+                        liveMA >= 5000f -> "Super Fast Charging"
+                        liveMA >= 2500f -> "Fast Charging"
+                        liveMA >= 1000f -> "Charging"
+                        else            -> "Slow Charging"
                     }
                     // Estimated time until full = remaining capacity ÷ live current.
-                    remainingTime = if (pct >= 100) {
-                        "Fully charged"
-                    } else {
-                        val chargeCounter = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER) // µAh
-                        if (chargeCounter > 0 && currentMagA > 0 && pct in 1..99) {
-                            val fullUah      = chargeCounter.toLong() * 100L / pct
+                    remainingTime = when {
+                        pct >= 100    -> "Fully charged"
+                        !saneRate || chargeCounter <= 0 || pct !in 1..99 -> ""
+                        else -> {
+                            val fullUah      = chargeCounter * 100L / pct
                             val remainingUah = (fullUah - chargeCounter).coerceAtLeast(0L)
-                            val hoursToFull  = remainingUah.toFloat() / currentMagA.toFloat()
-                            val hh = hoursToFull.toInt()
-                            val mm = ((hoursToFull - hh) * 60).toInt()
-                            when {
-                                hh > 0 -> "${hh}h ${mm}m until full"
-                                mm > 0 -> "${mm}m until full"
-                                else   -> ""
+                            val remainingMah = remainingUah / 1000L
+                            if (remainingMah > 20_000L) {
+                                ""  // absurd extrapolation → sensor noise
+                            } else {
+                                val hoursToFull = remainingUah.toFloat() / (liveMA * 1000f)
+                                val hh = hoursToFull.toInt()
+                                val mm = ((hoursToFull - hh) * 60).toInt()
+                                when {
+                                    hh > 0 -> "${hh}h ${mm}m until full"
+                                    mm > 0 -> "${mm}m until full"
+                                    else   -> ""
+                                }
                             }
-                        } else ""
+                        }
                     }
                 } else {
                     chargingWatts = ""
@@ -225,8 +291,8 @@ fun AODScreen() {
                         } else ""
                     } else {
                         val chargeCounter = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
-                        if (currentMicroA < 0 && chargeCounter > 0) {
-                            val hoursLeft = chargeCounter.toFloat() / currentMagA.toFloat()
+                        if (saneRate && chargeCounter > 0) {
+                            val hoursLeft = chargeCounter.toFloat() / (liveMA * 1000f)
                             val hh = hoursLeft.toInt()
                             val mm = ((hoursLeft - hh) * 60).toInt()
                             when {
@@ -236,6 +302,18 @@ fun AODScreen() {
                             }
                         } else ""
                     }
+                }
+
+                // Helps diagnosing device-specific charging readings via
+                // `adb logcat -s HKAOD` — only logs when something changes.
+                val debugSig = "$status|$plugged|$voltage|$currentMA|$chargingLabel"
+                if (debugSig != lastChargeSig) {
+                    lastChargeSig = debugSig
+                    Log.d(
+                        "HKAOD",
+                        "Charging: status=$status plugged=$plugged voltage=${voltage}mV " +
+                                "raw=${currentMA}mA live=${liveMA}mA watts=$wattValue label=$chargingLabel"
+                    )
                 }
             } catch (_: Exception) {}
             delay(1000L)
@@ -268,102 +346,218 @@ fun AODScreen() {
         }
     }
 
-    // ── Notifications ──
+    // ── Notifications & call intel ──
     val notifications by NotificationRepository.notifications.collectAsState()
+    val missedCallAt by AODService.missedCallAt.collectAsState()
+    var nowTick by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            nowTick = System.currentTimeMillis()
+            delay(30_000L)
+        }
+    }
+    val missedCallRecent = showCallIntel && missedCallAt > 0L &&
+            (nowTick - missedCallAt) < 15 * 60_000L
     Box(
         modifier = Modifier
             .fillMaxSize()
             .alpha(fadeAlpha.value)
             .background(Color.Black)
+            .onSizeChanged { containerSize = it }
+            // Report any touch so the overlay's auto-dismiss timer can reset.
             .pointerInput(Unit) {
-                detectTapGestures(
-                    onTap = { offset ->
-                        val now  = System.currentTimeMillis()
-                        val dist = sqrt(
-                            (offset.x - firstTapOffset.x) * (offset.x - firstTapOffset.x) +
-                                    (offset.y - firstTapOffset.y) * (offset.y - firstTapOffset.y)
-                        )
-                        if (now - firstTapTime < doubleTapTimeout && dist < doubleTapRadius) {
-                            firstTapTime = 0L
-                            startDismiss = true  // ✅ triggers LaunchedEffect
-                        } else {
-                            firstTapOffset = offset
-                            firstTapTime   = now
-                        }
-                    })
+                awaitPointerEventScope {
+                    while (true) {
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        if (event.changes.any { it.changedToDown() }) onInteraction()
+                    }
+                }
             }
-    ){
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 32.dp),
-            verticalArrangement = Arrangement.SpaceBetween
-        ) {
-
-
-            Column(modifier = Modifier.padding(top = 80.dp)) {
-
+            .pointerInput(Unit) {
+                // Single tap only — double taps are left to the system.
+                detectTapGestures(onTap = { startDismiss = true })
+            }
+    ) {
+        // Clock
+        if (clockPos.visible) {
+            AODPlacedElement(pos = clockPos, containerPx = containerSize) {
                 AODClock(
-                    time      = currentTime,
+                    time       = currentTime,
                     fontFamily = clockFontFamily,
-                    fontSize   = clockSize
+                    fontSize   = clockSize,
+                    textAlign  = aodTextAlign(clockPos.align)
                 )
+            }
+        }
 
-                Spacer(modifier = Modifier.height(8.dp))
-
+        // Date
+        if (datePos.visible) {
+            AODPlacedElement(pos = datePos, containerPx = containerSize) {
                 Text(
                     text      = currentDate,
                     color     = Color.White,
                     fontSize  = 16.sp,
                     fontWeight = FontWeight.Bold,
-                    modifier  = Modifier.fillMaxWidth(),
-                    textAlign = TextAlign.Center
+                    textAlign = aodTextAlign(datePos.align)
                 )
+            }
+        }
 
-                Spacer(modifier = Modifier.height(50.dp))
-                // Show the notification list whenever the "Notifications" toggle is on.
-                // (Previously this also required "Notification Intel", so enabling
-                //  "Notifications" alone never displayed anything.)
-                if (showNotifications && notifications.isNotEmpty()) {
-                    AODNotificationList(notifications = notifications)
+        // Notifications + intel (notification count / missed call)
+        val hasNotifs = notifications.isNotEmpty()
+        val showNotifBlock = notifPos.visible && (
+                (showNotifications && hasNotifs) ||
+                (showNotifIntel && hasNotifs) ||
+                missedCallRecent
+        )
+        if (showNotifBlock) {
+            AODPlacedElement(pos = notifPos, containerPx = containerSize) {
+                Column(
+                    modifier = Modifier.widthIn(max = 320.dp),
+                    horizontalAlignment = aodAlignment(notifPos.align)
+                ) {
+                    if (missedCallRecent) {
+                        Text(
+                            text       = "Missed call",
+                            color      = HKAOD_Red,
+                            fontSize   = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            textAlign  = aodTextAlign(notifPos.align),
+                            modifier   = Modifier.fillMaxWidth()
+                        )
+                    }
+                    if (showNotifIntel && hasNotifs && !showNotifications) {
+                        Text(
+                            text      = if (notifications.size == 1) "1 notification"
+                                        else "${notifications.size} notifications",
+                            color     = Color.White.copy(0.75f),
+                            fontSize  = 14.sp,
+                            textAlign = aodTextAlign(notifPos.align),
+                            modifier  = Modifier.fillMaxWidth()
+                        )
+                    }
+                    if (showNotifications && hasNotifs) {
+                        if (missedCallRecent) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
+                        AODNotificationList(
+                            notifications = notifications,
+                            align     = notifPos.align,
+                            modifier = Modifier
+                                .widthIn(max = 320.dp)
+                                .heightIn(max = 200.dp)
+                        )
+                    }
                 }
             }
-            Column(
-                modifier = Modifier.padding(bottom = 60.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                if (showMediaIntel && trackName.isNotEmpty()) {
-                    AODMediaRow(trackName = trackName, albumName = albumName)
-                    Spacer(modifier = Modifier.height(18.dp))
-                }
+        }
 
-                if (trackName.isNotEmpty()
-                    && prefs.getBoolean("ambient_media_controls", false)) {
-                    AODMediaControlsRow(isPlaying = isPlaying, trackName = trackName)
-                    Spacer(modifier = Modifier.height(18.dp))
-                }
-
-                if (showCharging) {
-                    if (isCharging) {
-                        AODChargingRow(
-                            level = batteryLevel,
-                            watts = chargingWatts,
-                            label = chargingLabel,
-                            eta   = remainingTime
+        // Media Intel + Media Controls — rendered as ONE block so the two
+        // never overlap each other at the same position.
+        if (mediaPos.visible && trackName.isNotEmpty() && (showMediaIntel || showMediaControls)) {
+            AODPlacedElement(pos = mediaPos, containerPx = containerSize) {
+                Column(
+                    modifier = Modifier.widthIn(max = 320.dp),
+                    horizontalAlignment = aodAlignment(mediaPos.align)
+                ) {
+                    if (showMediaIntel) {
+                        AODMediaRow(
+                            trackName = trackName,
+                            albumName = albumName,
+                            align     = mediaPos.align,
+                            modifier  = Modifier.fillMaxWidth()
                         )
-                    } else {
-                        AODBatteryRow(level = batteryLevel, remainingTime = remainingTime)
                     }
+                    if (showMediaIntel && showMediaControls) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                    }
+                    if (showMediaControls) {
+                        AODMediaControlsRow(
+                            isPlaying = isPlaying,
+                            trackName = trackName,
+                            align     = mediaPos.align,
+                            modifier  = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+            }
+        }
+
+        // Charging / Battery
+        if (showCharging && chargingPos.visible) {
+            AODPlacedElement(pos = chargingPos, containerPx = containerSize) {
+                if (isCharging) {
+                    AODChargingRow(
+                        level  = batteryLevel,
+                        watts  = chargingWatts,
+                        label  = chargingLabel,
+                        eta    = remainingTime,
+                        align  = chargingPos.align,
+                        modifier = Modifier.widthIn(max = 320.dp)
+                    )
+                } else {
+                    AODBatteryRow(
+                        level = batteryLevel,
+                        remainingTime = remainingTime,
+                        align = chargingPos.align,
+                        modifier = Modifier.widthIn(max = 320.dp)
+                    )
                 }
             }
         }
     }
 }
+
+@Composable
+fun aodTextAlign(align: String): TextAlign = when (align) {
+    "start" -> TextAlign.Start
+    "end"   -> TextAlign.End
+    else    -> TextAlign.Center
+}
+
+fun aodAlignment(align: String): Alignment.Horizontal = when (align) {
+    "start" -> Alignment.Start
+    "end"   -> Alignment.End
+    else    -> Alignment.CenterHorizontally
+}
+
+@Composable
+fun BoxScope.AODPlacedElement(
+    pos: AODPosition,
+    containerPx: IntSize,
+    content: @Composable BoxScope.() -> Unit
+) {
+    // The anchor is the CENTER of the element: x/y fractions position the
+    // element's centre, and scaling pivots about the centre so it never drifts.
+    var elemSize by remember { mutableStateOf(IntSize.Zero) }
+    Box(
+        modifier = Modifier
+            .wrapContentSize()
+            .onSizeChanged { elemSize = it }
+            // offset FIRST, graphicsLayer INSIDE: scaling then pivots about the
+            // element's own centre, so it stays pinned to x/y at any scale.
+            .offset {
+                IntOffset(
+                    (pos.x * containerPx.width - elemSize.width / 2f).roundToInt(),
+                    (pos.y * containerPx.height - elemSize.height / 2f).roundToInt()
+                )
+            }
+            .graphicsLayer {
+                val s = pos.scale
+                scaleX = s
+                scaleY = s
+                transformOrigin = TransformOrigin(0.5f, 0.5f)
+            }
+    ) { content() }
+}
+
 @Composable
 fun AODClock(
     time:       String,
     fontFamily: FontFamily,
-    fontSize:   Float = 80f
+    fontSize:   Float = 80f,
+    textAlign:  TextAlign = TextAlign.Center,
+    modifier:   Modifier = Modifier
 ) {
     Text(
         text          = time,
@@ -372,28 +566,32 @@ fun AODClock(
         color         = Color.White,
         fontFamily    = fontFamily,
         letterSpacing = 4.sp,
-        modifier      = Modifier.fillMaxWidth(),
-        textAlign     = TextAlign.Center
+        modifier      = modifier,
+        textAlign     = textAlign
     )
 }
 @Composable
-fun AODNotificationList(notifications: List<AODNotification>) {
+fun AODNotificationList(
+    notifications: List<AODNotification>,
+    align: String = "center",
+    modifier: Modifier = Modifier
+) {
+    val textAlign = aodTextAlign(align)
     LazyColumn(
-        modifier = Modifier
-            .fillMaxWidth()
+        modifier = modifier
             .heightIn(max = 220.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        items(notifications, key = { it.id }) { notif ->
-            AODNotificationItem(notif)
+        items(notifications, key = { it.key }) { notif ->
+            AODNotificationItem(notif, textAlign)
         }
     }
 }
 
 @Composable
-fun AODNotificationItem(notif: AODNotification) {
+fun AODNotificationItem(notif: AODNotification, textAlign: TextAlign = TextAlign.Center) {
     var visible by remember { mutableStateOf(false) }
-    LaunchedEffect(notif.id) {
+    LaunchedEffect(notif.key) {
         delay(80)
         visible = true
     }
@@ -416,7 +614,8 @@ fun AODNotificationItem(notif: AODNotification) {
                 fontSize   = 16.sp,
                 fontWeight = FontWeight.Bold,
                 maxLines   = 1,
-                overflow   = TextOverflow.Ellipsis
+                overflow   = TextOverflow.Ellipsis,
+                textAlign  = textAlign
             )
             if (notif.body.isNotEmpty()) {
                 Text(
@@ -424,7 +623,8 @@ fun AODNotificationItem(notif: AODNotification) {
                     color    = Color.White.copy(0.7f),
                     fontSize = 13.sp,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = textAlign
                 )
             }
         }
@@ -432,12 +632,17 @@ fun AODNotificationItem(notif: AODNotification) {
 }
 
 @Composable
-fun AODMediaRow(trackName: String, albumName: String) {
+fun AODMediaRow(
+    trackName: String,
+    albumName: String,
+    align: String = "center",
+    modifier: Modifier = Modifier
+) {
     val displayText = if (albumName.isNotEmpty()) "$trackName · $albumName" else trackName
 
     Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = Alignment.CenterHorizontally
+        modifier = modifier,
+        horizontalAlignment = aodAlignment(align)
     ) {
         Text(
             text       = displayText,
@@ -446,7 +651,8 @@ fun AODMediaRow(trackName: String, albumName: String) {
             fontWeight = FontWeight.Medium,
             maxLines   = 2,
             overflow   = TextOverflow.Ellipsis,
-            textAlign  = TextAlign.Center
+            modifier   = Modifier.fillMaxWidth(),
+            textAlign  = aodTextAlign(align)
         )
         Spacer(modifier = Modifier.height(10.dp))
         Box(
@@ -459,7 +665,14 @@ fun AODMediaRow(trackName: String, albumName: String) {
 }
 
 @Composable
-fun AODChargingRow(level: Int, watts: String, label: String, eta: String) {
+fun AODChargingRow(
+    level: Int,
+    watts: String,
+    label: String,
+    eta: String,
+    align: String = "center",
+    modifier: Modifier = Modifier
+) {
     val pulse by rememberInfiniteTransition(label = "pulse").animateFloat(
         initialValue = 0.5f,
         targetValue  = 1f,
@@ -469,12 +682,21 @@ fun AODChargingRow(level: Int, watts: String, label: String, eta: String) {
         ),
         label = "pulseAlpha"
     )
+    val textAlign = aodTextAlign(align)
 
     Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = Alignment.CenterHorizontally
+        modifier = modifier,
+        horizontalAlignment = aodAlignment(align)
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = when (align) {
+                "start" -> Arrangement.Start
+                "end"   -> Arrangement.End
+                else    -> Arrangement.Center
+            },
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Icon(
                 painter            = painterResource(id = R.drawable.lighting),
                 contentDescription = null,
@@ -506,7 +728,9 @@ fun AODChargingRow(level: Int, watts: String, label: String, eta: String) {
             Text(
                 text     = label,
                 color    = Color.White.copy(0.7f),
-                fontSize = 16.sp
+                fontSize = 16.sp,
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = textAlign
             )
         }
         if (eta.isNotEmpty()) {
@@ -514,30 +738,42 @@ fun AODChargingRow(level: Int, watts: String, label: String, eta: String) {
             Text(
                 text     = eta,
                 color    = Color.White.copy(0.5f),
-                fontSize = 13.sp
+                fontSize = 13.sp,
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = textAlign
             )
         }
     }
 }
 
 @Composable
-fun AODBatteryRow(level: Int, remainingTime: String) {
+fun AODBatteryRow(
+    level: Int,
+    remainingTime: String,
+    align: String = "center",
+    modifier: Modifier = Modifier
+) {
+    val textAlign = aodTextAlign(align)
     Column(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = Alignment.CenterHorizontally
+        modifier = modifier,
+        horizontalAlignment = aodAlignment(align)
     ) {
         Text(
             text       = "$level%",
             color      = Color.White,
             fontSize   = 15.sp,
-            fontWeight = FontWeight.Medium
+            fontWeight = FontWeight.Medium,
+            modifier   = Modifier.fillMaxWidth(),
+            textAlign  = textAlign
         )
         if (remainingTime.isNotEmpty()) {
             Spacer(modifier = Modifier.height(4.dp))
             Text(
                 text     = remainingTime,
                 color    = Color.White.copy(0.7f),
-                fontSize = 18.sp
+                fontSize = 18.sp,
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = textAlign
             )
         }
     }
@@ -546,7 +782,9 @@ fun AODBatteryRow(level: Int, remainingTime: String) {
 @Composable
 fun AODMediaControlsRow(
     isPlaying: Boolean,
-    trackName: String
+    trackName: String,
+    align: String = "center",
+    modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val audioManager = remember { context.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
@@ -560,6 +798,7 @@ fun AODMediaControlsRow(
 
     var currentVol by remember { mutableIntStateOf(audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)) }
     var showSlider by remember { mutableStateOf(false) }
+    var isDragging by remember { mutableStateOf(false) }
     var sliderProgress by remember { mutableFloatStateOf(currentVol.toFloat() / maxVol) }
     val volumeIcon = when {
         currentVol == 0 -> Icons.Default.VolumeOff
@@ -580,15 +819,16 @@ fun AODMediaControlsRow(
         }
     }
 
-    LaunchedEffect(showSlider) {
-        if (showSlider) {
+    // Auto-hide the slider 2 s after the gesture ends — never mid-drag.
+    LaunchedEffect(showSlider, isDragging) {
+        if (showSlider && !isDragging) {
             delay(2000L)
             showSlider = false
         }
     }
 
     Column(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         AnimatedVisibility(
@@ -620,7 +860,9 @@ fun AODMediaControlsRow(
                         color = Color.White.copy(0.6f),
                         fontSize = 12.sp,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.fillMaxWidth(),
+                        textAlign = aodTextAlign(align)
                     )
                 }
             }
@@ -680,6 +922,7 @@ fun AODMediaControlsRow(
                     detectDragGesturesAfterLongPress(
                         onDragStart = {
                             showSlider = true
+                            isDragging = true
                             currentVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
                             sliderProgress = currentVol.toFloat() / maxVol
                         },
@@ -691,8 +934,11 @@ fun AODMediaControlsRow(
                             audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, newVol, 0)
                             currentVol = newVol
                         },
-                        onDragEnd = { },
-                        onDragCancel = { showSlider = false }
+                        onDragEnd = { isDragging = false },
+                        onDragCancel = {
+                            isDragging = false
+                            showSlider = false
+                        }
                     )
                 },
             contentAlignment = Alignment.Center
@@ -707,13 +953,69 @@ fun AODMediaControlsRow(
     }
 }
 @Composable
-fun AODOverlayScreen(isAlwaysOn: Boolean, onDismiss: () -> Unit) {
+fun AODOverlayScreen(
+    isAlwaysOn: Boolean,
+    lockOnTimeout: Boolean = true,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+
+    // The overlay is created when the screen turns off (Always-On mode) or by a
+    // wake gesture (non-always-on mode). The auto-dismiss timer must only run
+    // while the display is actually ON — otherwise the overlay would lock and
+    // remove itself seconds after screen-off, long before a lift / wave / shake
+    // gesture ever wakes the screen, so the gesture would reveal the plain lock
+    // screen instead of the AOD.
+    var displayOn by remember { mutableStateOf(isDisplayOn(context)) }
+    var interactionKey by remember { mutableIntStateOf(0) }
+
+    DisposableEffect(Unit) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                when (intent.action) {
+                    Intent.ACTION_SCREEN_ON  -> displayOn = true
+                    Intent.ACTION_SCREEN_OFF -> displayOn = false
+                }
+            }
+        }
+        context.registerReceiver(receiver, IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+        })
+        onDispose { context.unregisterReceiver(receiver) }
+    }
+
+    // A gesture wakes the display and creates the overlay almost in the same
+    // instant — re-check the display state once shortly after to cover that race.
     LaunchedEffect(Unit) {
-        if (!isAlwaysOn) {
-            delay(10_000L)
-            AODService.getService()?.lockDevice()
+        delay(500L)
+        displayOn = isDisplayOn(context)
+    }
+
+    // Auto-dismiss after the user-configured AOD timeout (Ambient Settings);
+    // any touch resets the timer. Non-always-on gesture mode additionally locks
+    // the device so the display returns to sleep; "Tap to Show" only dismisses
+    // (see lockOnTimeout), which reveals the normal lock screen.
+    val timeoutMs = remember {
+        (context.getSharedPreferences("HKAOD_PREFS", Context.MODE_PRIVATE)
+            .getInt("aod_timeout_seconds", 10) * 1000L).coerceAtLeast(2_000L)
+    }
+    LaunchedEffect(isAlwaysOn, displayOn, interactionKey) {
+        if (!isAlwaysOn && displayOn) {
+            delay(timeoutMs)
+            if (lockOnTimeout) AODService.getService()?.lockDevice()
             onDismiss()
         }
     }
-    AODScreen()
+
+    AODScreen(onDismiss = onDismiss, onInteraction = { interactionKey++ })
+}
+
+private fun isDisplayOn(context: Context): Boolean {
+    return try {
+        val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        pm.isInteractive
+    } catch (_: Exception) {
+        true
+    }
 }
