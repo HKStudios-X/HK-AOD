@@ -23,6 +23,8 @@ object ClockStyleRepository {
     private const val CUSTOM_FONT_FILE = "clock_font.ttf"
     private const val PREF_USE_CUSTOM  = "clock_use_custom"
     private const val PREF_FONT_NAME   = "clock_font_name"
+    private const val PREF_STYLE       = "clock_style"
+    private const val PREF_SIZE        = "clock_size"
 
     private val _style = MutableStateFlow(ClockStyle.STYLE_1)
     val style: StateFlow<ClockStyle> = _style
@@ -43,6 +45,36 @@ object ClockStyleRepository {
         _useCustomFont.value = false
     }
     fun setSize(s: Float) { _size.value = s }
+
+    /** Persistently select a clock style (and switch off the custom font). */
+    fun setStyle(context: Context, s: ClockStyle) {
+        setStyle(s)
+        context.prefs().edit()
+            .putString(PREF_STYLE, s.name)
+            .putBoolean(PREF_USE_CUSTOM, false)
+            .apply()
+    }
+
+    /** Persistently change the clock size. */
+    fun setSize(context: Context, s: Float) {
+        setSize(s)
+        context.prefs().edit().putFloat(PREF_SIZE, s).apply()
+    }
+
+    /**
+     * Restore style, size and custom font from prefs. Call on app/service start
+     * so the AOD renders the user's selection even after the process is killed.
+     */
+    fun loadFromPrefs(context: Context) {
+        val prefs = context.prefs()
+        val savedStyle = prefs.getString(PREF_STYLE, null)
+        if (savedStyle != null) {
+            runCatching { ClockStyle.valueOf(savedStyle) }
+                .onSuccess { _style.value = it }
+        }
+        setSize(prefs.getFloat(PREF_SIZE, 80f).coerceIn(30f, 200f))
+        loadPersistedCustomFont(context)
+    }
 
     /** The font the clock should actually render with right now. */
     fun effectiveFontFamily(style: ClockStyle): FontFamily {

@@ -3,19 +3,24 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.WindowInsets
 import android.view.WindowManager
 import android.widget.VideoView
 import androidx.appcompat.app.AppCompatActivity
 
 class SplashActivity : AppCompatActivity() {
+
+    // Guards against navigating twice (completion + error/fallback racing).
+    private var navigated = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val prefs = getSharedPreferences("HKAOD_PREFS", MODE_PRIVATE)
         val isFirstRun = prefs.getBoolean("isFirstRun", true)
         if (!isFirstRun) {
-            startActivity(Intent(this, MainActivity::class.java))
-            finish()
+            goToMain()
             return
         }
         if (!isTaskRoot && intent.hasCategory(Intent.CATEGORY_LAUNCHER) &&
@@ -36,13 +41,26 @@ class SplashActivity : AppCompatActivity() {
         val videoPath = "android.resource://" + packageName + "/" + R.raw.intro
         val uri = Uri.parse(videoPath)
 
+        // If the intro can't play (unsupported codec, corrupt file, ...) or
+        // never finishes, the user must never be stuck on a black screen.
+        // A hard fallback closes the splash no matter what happens.
+        Handler(Looper.getMainLooper()).postDelayed({ goToMain() }, 30_000L)
+
+        videoView.setOnCompletionListener { goToMain() }
+        videoView.setOnErrorListener { _, _, _ ->
+            goToMain()
+            true
+        }
         videoView.setVideoURI(uri)
         videoView.start()
-        videoView.setOnCompletionListener {
-            prefs.edit().putBoolean("isFirstRun", false).apply()
-            val intent = Intent(this@SplashActivity, MainActivity::class.java)
-            startActivity(intent)
-            finish()
-        }
+    }
+
+    private fun goToMain() {
+        if (navigated) return
+        navigated = true
+        getSharedPreferences("HKAOD_PREFS", MODE_PRIVATE)
+            .edit().putBoolean("isFirstRun", false).apply()
+        startActivity(Intent(this, MainActivity::class.java))
+        finish()
     }
 }

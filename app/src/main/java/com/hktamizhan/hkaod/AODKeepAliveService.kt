@@ -7,7 +7,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 
 class AODKeepAliveService : Service() {
@@ -18,7 +21,13 @@ class AODKeepAliveService : Service() {
 
         fun start(context: Context) {
             val intent = Intent(context, AODKeepAliveService::class.java)
-            context.startForegroundService(intent)
+            try {
+                context.startForegroundService(intent)
+            } catch (e: Exception) {
+                // Background-start restrictions can reject this; the service is
+                // a convenience, never something the app should crash over.
+                Log.w("HKAOD", "KeepAlive start rejected: ${e.message}")
+            }
         }
 
         fun stop(context: Context) {
@@ -29,7 +38,16 @@ class AODKeepAliveService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification())
+        val notification = buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -41,7 +59,11 @@ class AODKeepAliveService : Service() {
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
         val restartIntent = Intent(applicationContext, AODKeepAliveService::class.java)
-        startForegroundService(restartIntent)
+        try {
+            startForegroundService(restartIntent)
+        } catch (e: Exception) {
+            Log.w("HKAOD", "KeepAlive restart rejected: ${e.message}")
+        }
     }
 
     private fun createNotificationChannel() {

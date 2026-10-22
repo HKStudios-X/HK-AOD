@@ -2,6 +2,7 @@ package com.hktamizhan.hkaod
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.app.Notification
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -48,8 +49,24 @@ class AODService : AccessibilityService(), SensorEventListener {
         // Standard gravity in m/s² — the accelerometer magnitude at rest
         const val GRAVITY = 9.8f
 
+        // How long the proximity sensor must stay covered to count as a pocket.
+        const val POCKET_CONFIRM_MS = 800L
+
         // Call state for future AODCallScreen
         val callState = MutableStateFlow(android.telephony.TelephonyManager.CALL_STATE_IDLE)
+
+        // Timestamp of the last call that rang but was never answered.
+        // Used by "Call Intel" on the AOD to show a "Missed call" line.
+        val missedCallAt = MutableStateFlow(0L)
+
+        // Tap-to-Show: minimum accelerometer impulse (m/s²) for a finger tap
+        // on the phone to count. Scaled by the Tap Sensitivity setting.
+        const val TAP_SPIKE_BASE = 1.15f
+
+        // Tap-to-Show: how long to wait before treating a spike as a single
+        // tap. The system's own double-tap wake turns the display on inside
+        // this window, and the AOD is then skipped so the lock screen stays.
+        const val TAP_CONFIRM_MS = 380L
     }
 
     // ─── Sensors ─────────────────────────────────────────────────
@@ -64,6 +81,13 @@ class AODService : AccessibilityService(), SensorEventListener {
     private var nearStartTime        = 0L   // when proximity first read "near"
     private var isCovered            = false  // pocket confirmed (≥800ms cover)
     private var lastPocketStateChangeTime = 0L
+
+    // Proximity sensors only report a state *change* — there is no second
+    // event while the sensor stays covered. The "covered ≥800 ms" pocket
+    // confirmation therefore cannot be decided inside onSensorChanged; it is
+    // armed as a delayed callback on the "near" event instead.
+    private val pocketHandler = Handler(Looper.getMainLooper())
+    private var pocketConfirmRunnable: Runnable? = null
 
     // ─── Lift-to-wake state ───────────────────────────────────────
     // Magnitude-based: total acceleration ≈ 9.8 (gravity) at rest in
@@ -85,10 +109,25 @@ class AODService : AccessibilityService(), SensorEventListener {
     // ─── Telephony ───────────────────────────────────────────────
     private var telephonyManager:   android.telephony.TelephonyManager? = null
     private var phoneStateListener: android.telephony.PhoneStateListener? = null
+    private var wasRinging = false
 
     // ─── Overlay ─────────────────────────────────────────────────
     private var overlayView:           android.view.View? = null
     private var overlayLifecycleOwner: OverlayLifecycleOwner? = null
+
+    // ─── Tap-to-Show state ────────────────────────────────────────
+    // A switched-off screen cannot report touches to an app, so a tap is
+    // recognised from the small shock it sends through the phone: with the
+    // display off and the phone at rest, a sharp, short spike in the
+    // accelerometer magnitude counts as a tap. A single tap (no second spike
+    // and no wake inside the confirm window) shows the AOD; the system's own
+    // double-tap wake is left untouched and keeps going to the lock screen.
+    private val tapHandler = Handler(Looper.getMainLooper())
+    private var tapConfirmRunnable: Runnable? = null
+    private var tapBaseline         = GRAVITY  // low-pass filtered magnitude
+    private var tapQuietSince       = 0L       // when the phone last settled
+    private var lastTapSpikeAt      = 0L       // last accepted spike time
+    private var displayInteractive  = true     // kept in sync with screen broadcasts
 
     // ─── Notification Repository ──────────────────────────────────
     data class AODNotification(
@@ -97,7 +136,10 @@ class AODService : AccessibilityService(), SensorEventListener {
         val body:        String,
         val packageName: String,
         val postTime:    Long = System.currentTimeMillis()
-    )
+    ) {
+        /** Globally unique key — `id` alone collides across apps. */
+        val key: String get() = "$packageName/$id"
+    }
 
     object NotificationRepository {
         private val _notifications = MutableStateFlow<List<AODNotification>>(emptyList())
@@ -115,19 +157,28 @@ class AODService : AccessibilityService(), SensorEventListener {
 
                 Intent.ACTION_SCREEN_OFF -> {
                     Log.d("HKAOD", "── SCREEN OFF ──")
+                    displayInteractive = false
                     resetSensorState()
                     checkAndStartAODLogic()
                 }
 
                 Intent.ACTION_SCREEN_ON -> {
-                    // Display woke (gesture or power button) — the AOD overlay
-                    // stays visible. Keep sensors running so the next gesture
-                    // and sleep cycle are handled.
-                    Log.d("HKAOD", "── SCREEN ON — AOD overlay kept visible, sensors ready ──")
+                    // Display woke (double-tap, power button or a gesture).
+                    // Always-On mode keeps its overlay alive. "Tap to Show"
+                    // deliberately does NOT show the AOD here: a normal wake
+                    // (double tap / power) must go to the lock screen — the
+                    // AOD is instead shown by the tap detector on a single tap.
+                    Log.d("HKAOD", "── SCREEN ON — sensors ready ──")
+                    displayInteractive = true
                     val prefs = getSharedPreferences("HKAOD_PREFS", MODE_PRIVATE)
+                    if (prefs.getBoolean("ambient_enabled", false)) {
+                        startAODOverlay()
+                    }
                     if (anySensorEnabled(prefs)) {
                         resetSensorState()
                         registerSensors()
+                    } else {
+                        stopSensors()
                     }
                 }
 
@@ -147,17 +198,105 @@ class AODService : AccessibilityService(), SensorEventListener {
                 || prefs.getBoolean("wave_enabled",  false)
                 || prefs.getBoolean("shake_enabled", false)
                 || prefs.getBoolean("pocket_detection_enabled", false)
+                || prefs.getBoolean("ambient_tap_to_show", false)
     }
 
     private fun resetSensorState() {
-        nearStartTime      = 0L
-        isCovered          = false
         liftRestStart      = 0L
         liftMoveStart      = 0L
         shakeWaveCount     = 0
         lastShakeWave      = 0L
         wasMoving          = false
-        sensorsRegistered  = false
+        // Tap-to-Show — a fresh settle is required after every screen change.
+        cancelTapConfirmation()
+        tapBaseline    = GRAVITY
+        tapQuietSince  = 0L
+        lastTapSpikeAt = 0L
+    }
+
+    // Full pocket-state reset — only on service (re)connect. The pocket state
+    // itself must survive screen transitions: the phone stays covered even
+    // while the screen turns on/off, and the release must still wake it.
+    private fun resetPocketState() {
+        cancelPocketConfirmation()
+        nearStartTime             = 0L
+        isCovered                 = false
+        lastPocketStateChangeTime = 0L
+    }
+
+    // ─── Pocket confirmation ─────────────────────────────────────
+    // Armed on the "near" event; fires 800 ms later only if the sensor is
+    // still covered (nearStartTime untouched) and the pocket is not yet
+    // confirmed. Cancelled as soon as the sensor reports "far".
+    private fun armPocketConfirmation(token: Long) {
+        cancelPocketConfirmation()
+        val r = Runnable {
+            pocketConfirmRunnable = null
+            if (nearStartTime == token && token > 0L && !isCovered) {
+                isCovered = true
+                lastPocketStateChangeTime = System.currentTimeMillis()
+                Log.d("HKAOD", "Pocket confirmed (${POCKET_CONFIRM_MS}ms cover) — removing AOD + locking")
+                removeAODOverlay()
+                lockDevice()
+            }
+        }
+        pocketConfirmRunnable = r
+        pocketHandler.postDelayed(r, POCKET_CONFIRM_MS)
+    }
+
+    private fun cancelPocketConfirmation() {
+        pocketConfirmRunnable?.let { pocketHandler.removeCallbacks(it) }
+        pocketConfirmRunnable = null
+    }
+
+    // ─── Tap-to-Show detection ────────────────────────────────────
+    // Runs on accelerometer samples while the display is off. The phone must
+    // have settled first (tapQuietSince), then a finger tap must produce a
+    // sharp impulse above the sensitivity threshold. Confirmation is delayed a
+    // few hundred ms: if the display comes on inside that window — that is the
+    // system's own double-tap wake — the AOD is NOT shown, so double taps keep
+    // going to the normal lock screen.
+    private fun handleTapDetection(magnitude: Float, now: Long) {
+        // Low-pass baseline ≈ the phone's current rest level. Taps are brief,
+        // so they barely move it and stand out as an impulse.
+        tapBaseline += (magnitude - tapBaseline) * 0.12f
+        val impulse = abs(magnitude - tapBaseline)
+
+        if (impulse < 0.22f) {
+            if (tapQuietSince == 0L) tapQuietSince = now
+            return
+        }
+
+        val quietFor = if (tapQuietSince != 0L) now - tapQuietSince else 0L
+        tapQuietSince = 0L
+
+        val prefs       = getSharedPreferences("HKAOD_PREFS", MODE_PRIVATE)
+        val sensitivity = prefs.getInt("tap_sensitivity", 100).coerceIn(50, 200) / 100f
+        val threshold   = TAP_SPIKE_BASE * (1f / sensitivity)
+
+        if (impulse > threshold && quietFor > 200L && (now - lastTapSpikeAt) > 120L) {
+            lastTapSpikeAt = now
+            Log.d("HKAOD", "Tap spike (impulse=%.2f threshold=%.2f) — confirming…".format(impulse, threshold))
+            cancelTapConfirmation()
+            val r = Runnable {
+                tapConfirmRunnable = null
+                when {
+                    displayInteractive -> Log.d("HKAOD", "Tap confirm: display already on — system wake keeps the lock screen")
+                    isCovered          -> Log.d("HKAOD", "Tap confirm: pocketed — ignored")
+                    else -> {
+                        Log.d("HKAOD", "Single tap → showing AOD")
+                        wakeScreen()
+                    }
+                }
+            }
+            tapConfirmRunnable = r
+            tapHandler.postDelayed(r, TAP_CONFIRM_MS)
+        }
+    }
+
+    private fun cancelTapConfirmation() {
+        tapConfirmRunnable?.let { tapHandler.removeCallbacks(it) }
+        tapConfirmRunnable = null
     }
 
     // ─── Wake Screen ─────────────────────────────────────────────
@@ -175,12 +314,25 @@ class AODService : AccessibilityService(), SensorEventListener {
                 PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
                 "hkaod:sensorwake"
             )
-            wl.acquire(2000L) // hold for 2s — enough to bring the display up
-            Handler(Looper.getMainLooper()).postDelayed({ wl.release() }, 2000L)
+            // Acquire with an overall safety timeout, and release the moment the
+            // display has been brought up. `isHeld` matters: release() on a
+            // wake lock that the timeout already released throws
+            // "WakeLock under-locked" and would crash the service.
+            wl.acquire(5_000L)
+            Handler(Looper.getMainLooper()).postDelayed({
+                try {
+                    if (wl.isHeld) wl.release()
+                } catch (e: Exception) {
+                    Log.w("HKAOD", "WakeLock release failed: ${e.message}")
+                }
+            }, 2_000L)
             Log.d("HKAOD", "Display woken via WakeLock — AOD overlay kept visible")
         } catch (e: Exception) {
             Log.e("HKAOD", "WakeLock failed: ${e.message}")
         }
+        // A gesture must always reveal the AOD, even if the overlay timed out
+        // earlier. startAODOverlay() no-ops when the overlay is already up.
+        startAODOverlay()
     }
 
     // ─── Lifecycle ────────────────────────────────────────────────
@@ -191,10 +343,12 @@ class AODService : AccessibilityService(), SensorEventListener {
         lastWaveTriggerTime  = 0L
         lastShakeTriggerTime = 0L
         resetSensorState()
+        resetPocketState()
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         proximity     = sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY)
+        Log.d("HKAOD", "Sensors available: accelerometer=${accelerometer != null} proximity=${proximity != null}")
 
         telephonyManager = getSystemService(Context.TELEPHONY_SERVICE)
                 as android.telephony.TelephonyManager
@@ -204,16 +358,24 @@ class AODService : AccessibilityService(), SensorEventListener {
             override fun onCallStateChanged(state: Int, phoneNumber: String?) {
                 callState.value = state
                 when (state) {
-                    android.telephony.TelephonyManager.CALL_STATE_RINGING,
-                    android.telephony.TelephonyManager.CALL_STATE_OFFHOOK -> {
-                        Log.d("HKAOD", "Call state=$state — removing AOD")
+                    android.telephony.TelephonyManager.CALL_STATE_RINGING -> {
+                        wasRinging = true
+                        Log.d("HKAOD", "Call state=RINGING — removing AOD")
                         removeAODOverlay()
                         stopSensors()
-                        // TODO: startAODCallOverlay() when AODCallScreen is ready
+                    }
+                    android.telephony.TelephonyManager.CALL_STATE_OFFHOOK -> {
+                        wasRinging = false
+                        Log.d("HKAOD", "Call state=OFFHOOK — removing AOD")
+                        removeAODOverlay()
+                        stopSensors()
                     }
                     android.telephony.TelephonyManager.CALL_STATE_IDLE -> {
+                        // RINGING → IDLE (without OFFHOOK) means the call was
+                        // never answered. Remember it so the AOD can show it.
+                        if (wasRinging) missedCallAt.value = System.currentTimeMillis()
+                        wasRinging = false
                         Log.d("HKAOD", "Call ended")
-                        // TODO: removeAODCallOverlay() when AODCallScreen is ready
                     }
                 }
             }
@@ -239,6 +401,9 @@ class AODService : AccessibilityService(), SensorEventListener {
             addAction(Intent.ACTION_USER_PRESENT)
         }
         registerReceiver(screenStateReceiver, filter)
+        displayInteractive = try {
+            (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive
+        } catch (_: Exception) { true }
 
         serviceInfo = AccessibilityServiceInfo().apply {
             eventTypes   = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
@@ -278,11 +443,12 @@ class AODService : AccessibilityService(), SensorEventListener {
 
     // ─── AOD Logic ────────────────────────────────────────────────
     // On screen off:
-    // 1. Always start AOD overlay immediately
+    // 1. Always-On mode → keep the AOD overlay alive for the whole
+    //    screen-off period. Otherwise no overlay is kept (a wake
+    //    gesture creates it on demand — see wakeScreen()).
     // 2. Register sensors if any wake trigger is enabled
-    //    → sensors call wakeScreen() which removes the overlay and wakes
-    //       the display. The system timeout turns the screen off, and
-    //       the next SCREEN_OFF cycle restarts the overlay.
+    //    → sensors call wakeScreen() which wakes the display and makes
+    //       sure the AOD overlay is showing.
     private fun checkAndStartAODLogic() {
         if (isInCall()) {
             Log.d("HKAOD", "Call in progress — skipping AOD")
@@ -298,19 +464,34 @@ class AODService : AccessibilityService(), SensorEventListener {
 
         Log.d("HKAOD", "checkAOD → alwaysOn=$isAlwaysOn lift=$isLiftEnabled wave=$isWaveEnabled shake=$isShakeEnabled pocket=$isPocketEnabled")
 
-        // ✅ Start AOD overlay regardless of which trigger is set
-        startAODOverlay()
+        if (isAlwaysOn) {
+            // Always-On mode: keep the overlay alive for the whole screen-off
+            // period so it is already visible whenever the display wakes.
+            startAODOverlay()
+        } else {
+            // Not always-on: don't leave a Compose overlay alive all night.
+            // A wake gesture — or a single tap (Tap to Show) — re-creates it
+            // (see wakeScreen()).
+            removeAODOverlay()
+        }
 
         // ✅ Register sensors to wake screen (not to start overlay)
         if (isLiftEnabled || isWaveEnabled || isShakeEnabled || isPocketEnabled) {
             resetSensorState()
             registerSensors()
+        } else {
+            // No triggers enabled — don't keep draining the battery.
+            resetSensorState()
+            stopSensors()
         }
     }
 
     // ─── Sensors ─────────────────────────────────────────────────
     private fun registerSensors() {
         if (sensorsRegistered) return
+        // Clear any stale registration before (re)registering so the same
+        // listener can never be registered twice.
+        sensorManager.unregisterListener(this)
         // Accelerometer needs a fast rate (~20ms) — at SENSOR_DELAY_NORMAL (~200ms)
         // the brief peak of a shake/lift falls between samples and is missed.
         accelerometer?.let {
@@ -326,6 +507,13 @@ class AODService : AccessibilityService(), SensorEventListener {
     }
 
     private fun stopSensors() {
+        // No more proximity events will arrive — drop any in-flight pocket
+        // measurement so a stale near event can't confirm a "pocket" later.
+        cancelPocketConfirmation()
+        nearStartTime = 0L
+        // A pending tap confirmation must not wake the screen after the
+        // sensors were stopped (incoming call, unlock, service teardown).
+        cancelTapConfirmation()
         sensorManager.unregisterListener(this)
         sensorsRegistered = false
         Log.d("HKAOD", "Sensors stopped")
@@ -349,42 +537,45 @@ class AODService : AccessibilityService(), SensorEventListener {
             val isNear        = event.values[0] < nearThreshold
 
             if (isNear) {
-                // Track how long the sensor has been covered
-                if (nearStartTime == 0L) nearStartTime = now
-
-                // Pocket = sustained cover (≥800ms), not a brief hand pass.
-                // Only lock once per cover — guarded by isCovered.
-                if (pocketDetection && !isCovered && (now - nearStartTime) >= 800L) {
-                    isCovered = true
-                    lastPocketStateChangeTime = now
-                    Log.d("HKAOD", "Pocket detected (${now - nearStartTime}ms) — removing AOD + locking")
-                    removeAODOverlay()
-                    lockDevice()
+                // The sensor only reports state *changes* — this single "near"
+                // event is all we get until it is uncovered. Start (or resume)
+                // tracking and arm the delayed pocket confirmation.
+                if (nearStartTime == 0L) {
+                    nearStartTime = now
+                    if (pocketDetection && !isCovered) armPocketConfirmation(now)
                 }
             } else {
-                val nearDuration = if (nearStartTime > 0L) now - nearStartTime else 0L
+                // Cover ended. Cancel a pending pocket confirmation and
+                // measure how long the sensor stayed covered.
+                cancelPocketConfirmation()
+                val hadNear      = nearStartTime > 0L
+                val nearDuration = if (hadNear) now - nearStartTime else 0L
                 nearStartTime = 0L
 
-                if (nearDuration > 0L) {
-                    // ── Wave to wake ──
-                    // Brief cover (30-500ms) = a wave. Pocket detection
-                    // requires ≥800ms, so waves never lock the phone.
-                    if (waveEnabled && nearDuration in 30L..500L
-                        && (now - lastWaveTriggerTime) > 1500L) {
-                        lastWaveTriggerTime = now
-                        Log.d("HKAOD", "Wave → waking screen (near=${nearDuration}ms)")
-                        wakeScreen()
-                    }
-
-                    // ── Pocket released ──
-                    if (pocketDetection && isCovered
-                        && (now - lastPocketStateChangeTime) > 1000L) {
-                        isCovered = false
+                // ── Pocket released ──
+                // isCovered is true only after the ≥800ms confirmation, so a
+                // wave/tap never triggers this branch.
+                if (pocketDetection && isCovered) {
+                    isCovered = false
+                    if (hadNear && (now - lastPocketStateChangeTime) > 1000L) {
                         lastPocketStateChangeTime = now
                         Log.d("HKAOD", "Pocket released — waking screen + AOD")
                         wakeScreen()
                         startAODOverlay()
                     }
+                } else if (isCovered) {
+                    // Pocket detection is off now — just drop the stale state.
+                    isCovered = false
+                }
+
+                // ── Wave to wake ──
+                // Brief cover (30-500ms) = a wave. Pocket detection
+                // requires ≥800ms, so waves never lock the phone.
+                if (waveEnabled && hadNear && nearDuration in 30L..500L
+                    && (now - lastWaveTriggerTime) > 1500L) {
+                    lastWaveTriggerTime = now
+                    Log.d("HKAOD", "Wave → waking screen (near=${nearDuration}ms)")
+                    wakeScreen()
                 }
             }
         }
@@ -398,6 +589,14 @@ class AODService : AccessibilityService(), SensorEventListener {
             // Total acceleration magnitude. At rest this is exactly ~9.8
             // (gravity) in ANY orientation, so it needs no per-axis baseline.
             val magnitude = sqrt((x * x + y * y + z * z).toDouble()).toFloat()
+
+            // ── Tap to Show ──
+            // Only meaningful while the display is really off, and skipped in
+            // a confirmed pocket (nothing to see in there).
+            if (prefs.getBoolean("ambient_tap_to_show", false)
+                && !displayInteractive && !isCovered) {
+                handleTapDetection(magnitude, now)
+            }
 
             // ── Lift to Wake Screen ──
             // Phone must rest (magnitude ≈ gravity) for ≥600ms, then the
@@ -497,14 +696,24 @@ class AODService : AccessibilityService(), SensorEventListener {
             }
             overlayLifecycleOwner = lifecycleOwner
 
+            // Persistent only when the dashboard's "Always On" mode is on.
+            // Otherwise the overlay times out so it doesn't stay stuck.
+            // In "Tap to Show" mode the timeout only dismisses the AOD — it
+            // must NOT lock the device, because the user woke it to glance at
+            // the AOD and may be about to unlock.
+            val prefs = getSharedPreferences("HKAOD_PREFS", MODE_PRIVATE)
+            val isAlwaysOn = prefs.getBoolean("ambient_enabled", false)
+            val lockOnTimeout = !prefs.getBoolean("ambient_tap_to_show", false)
+
             val composeView = ComposeView(this).apply {
                 setViewTreeLifecycleOwner(lifecycleOwner)
                 setViewTreeViewModelStoreOwner(lifecycleOwner)
                 setViewTreeSavedStateRegistryOwner(lifecycleOwner)
                 setContent {
                     AODOverlayScreen(
-                        isAlwaysOn = true, // ✅ always on — screen timeout handles dismiss
-                        onDismiss  = { removeAODOverlay() }
+                        isAlwaysOn    = isAlwaysOn,
+                        lockOnTimeout = lockOnTimeout,
+                        onDismiss     = { removeAODOverlay() }
                     )
                 }
             }
@@ -513,6 +722,11 @@ class AODService : AccessibilityService(), SensorEventListener {
 
             try {
                 wm.addView(composeView, params)
+                // Hide the status/navigation bars for this overlay window so the
+                // AOD really is a full-black screen (API 30+).
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    composeView.windowInsetsController?.hide(android.view.WindowInsets.Type.systemBars())
+                }
                 Log.d("HKAOD", "AOD Overlay addView SUCCESS")
             } catch (e: Exception) {
                 Log.e("HKAOD", "addView FAILED: ${e.message}")
@@ -547,18 +761,34 @@ class AODService : AccessibilityService(), SensorEventListener {
     // ─── Notification Listener ───────────────────────────────────
     class AODNotificationListener : NotificationListenerService() {
         override fun onNotificationPosted(sbn: StatusBarNotification) {
-            val extras = sbn.notification.extras
-            val title  = extras.getString("android.title") ?: return
-            val body   = extras.getCharSequence("android.text")?.toString() ?: ""
+            // Never mirror our own (foreground-service) notification, group
+            // summaries or other ongoing/system entries on the AOD.
+            if (sbn.packageName == packageName) return
+            val n = sbn.notification ?: return
+            if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
+            if (n.flags and Notification.FLAG_ONGOING_EVENT != 0) return
+            if (n.flags and Notification.FLAG_FOREGROUND_SERVICE != 0) return
+
+            val extras = n.extras
+            // Titles/bodies are CharSequences (often SpannedString) — calling
+            // getString() throws ClassCastException on those.
+            val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim()
+            if (title.isNullOrEmpty()) return
+            val body = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim()
+                ?: extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString()?.trim()
+                ?: ""
+
+            val notif = AODNotification(sbn.id, title, body, sbn.packageName)
             val current = NotificationRepository.notifications.value.toMutableList()
-            current.removeAll { it.id == sbn.id }
-            current.add(0, AODNotification(sbn.id, title, body, sbn.packageName))
+            current.removeAll { it.key == notif.key }
+            current.add(0, notif)
             NotificationRepository.update(current.take(8))
         }
 
         override fun onNotificationRemoved(sbn: StatusBarNotification) {
+            val key = "${sbn.packageName}/${sbn.id}"
             NotificationRepository.update(
-                NotificationRepository.notifications.value.filter { it.id != sbn.id }
+                NotificationRepository.notifications.value.filter { it.key != key }
             )
         }
     }

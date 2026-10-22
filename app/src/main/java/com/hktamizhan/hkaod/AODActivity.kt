@@ -1,7 +1,6 @@
 package com.hktamizhan.hkaod
 
 import android.app.Activity
-import android.app.KeyguardManager
 import android.content.Context
 import android.os.Build
 import android.os.Bundle
@@ -23,9 +22,9 @@ import kotlinx.coroutines.delay
 class AODActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
         setupLockscreen()
         setupWindowFlagsEarly()
-        super.onCreate(savedInstanceState)
         overridePendingTransition(0, 0)
         setContent {
             AODActivityScreen()
@@ -70,14 +69,13 @@ class AODActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
-            val km = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-            km.requestDismissKeyguard(this, null)
+            // Deliberately NOT dismissing the keyguard: the AOD must draw on
+            // top of the lock screen, not unlock the device.
         } else {
             @Suppress("DEPRECATION")
             window.addFlags(
                 WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
-                        WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON   or
-                        WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
+                        WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
             )
         }
     }
@@ -131,7 +129,9 @@ fun AODActivityScreen() {
         }
 
         if (!isAlwaysOn) {
-            delay(10_000L)
+            val timeoutMs = (prefs.getInt("aod_timeout_seconds", 10) * 1000L)
+                .coerceAtLeast(2_000L)
+            delay(timeoutMs)
             // Prefer locking the device via the accessibility service; if it isn't
             // available, just finish the activity. Either way the screen closes.
             AODService.getService()?.lockDevice()
@@ -141,5 +141,5 @@ fun AODActivityScreen() {
 
 
     BackHandler(enabled = true) {}
-    AODScreen()
+    AODScreen(onDismiss = { activity?.finish() })
 }

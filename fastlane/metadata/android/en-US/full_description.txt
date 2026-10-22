@@ -1,0 +1,12 @@
+HK-AOD is an open-source Always On Display application for Any Android Device
+
+Features:
+
+• Custom clock styles
+• Battery information
+• Notification display
+• AMOLED friendly design
+• Lightweight and fast
+• No advertisements
+
+Source code is available on GitHub.

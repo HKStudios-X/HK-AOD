@@ -30,30 +30,30 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
-    android.applicationVariants.all {
-        val variant = this
-        assembleProvider.configure {
-            doLast {
-                variant.outputs.all {
-                    // We cast this to BaseVariantOutput to access the 'outputFile' property
-                    val output = this as com.android.build.gradle.api.BaseVariantOutput
-                    val outputDir = file("D:/apks")
-
-                    if (!outputDir.exists()) {
-                        outputDir.mkdirs()
-                    }
-
-                    copy {
-                        from(output.outputFile)
-                        into(outputDir)
-                        // This renames the file to include the build type (debug/release)
-                        rename { "MyCustomApp-${variant.name}.apk" }
-                    }
-                    println("Successfully copied APK to: F:/apks")
-                }
-            }
-        }
-    }
+//    android.applicationVariants.all {
+//        val variant = this
+//        assembleProvider.configure {
+//            doLast {
+//                variant.outputs.all {
+//                    // We cast this to BaseVariantOutput to access the 'outputFile' property
+//                    val output = this as com.android.build.gradle.api.BaseVariantOutput
+//                    val outputDir = file("D:/apks")
+//
+//                    if (!outputDir.exists()) {
+//                        outputDir.mkdirs()
+//                    }
+//
+//                    copy {
+//                        from(output.outputFile)
+//                        into(outputDir)
+//                        // This renames the file to include the build type (debug/release)
+//                        rename { "MyCustomApp-${variant.name}.apk" }
+//                    }
+//                    println("Successfully copied APK to: F:/apks")
+//                }
+//            }
+//        }
+//    }
 
     buildTypes {
         release {
@@ -85,7 +85,6 @@ dependencies {
     implementation(libs.material)
     implementation(libs.androidx.activity)
     implementation(libs.androidx.constraintlayout)
-    implementation(libs.androidx.compose.material3)
     implementation("androidx.compose.material:material-icons-extended")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
