@@ -8,6 +8,7 @@ import android.Manifest
 import android.content.ComponentName
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.text.TextUtils
@@ -116,6 +117,42 @@ val hkFontFamily6 = FontFamily(
     Font(R.font.rocky, FontWeight.Normal),
     Font(R.font.rocky, FontWeight.Bold)
 )
+// Additional clock presets — one family per bundled TTF. Bold requests reuse
+// the same file, matching the existing presets above.
+private fun clockFontFamily(id: Int) = FontFamily(
+    Font(id, FontWeight.Normal),
+    Font(id, FontWeight.Bold)
+)
+val hkFontFamily7  = clockFontFamily(R.font.aclonica)
+val hkFontFamily8  = clockFontFamily(R.font.amarante)
+val hkFontFamily9  = clockFontFamily(R.font.bariol)
+val hkFontFamily10 = clockFontFamily(R.font.cagliostro)
+val hkFontFamily11 = clockFontFamily(R.font.comfortaa)
+val hkFontFamily12 = clockFontFamily(R.font.comic_sans)
+val hkFontFamily13 = clockFontFamily(R.font.coolstory)
+val hkFontFamily14 = clockFontFamily(R.font.dotmatrix_bold)
+val hkFontFamily15 = clockFontFamily(R.font.fluidsans)
+val hkFontFamily16 = clockFontFamily(R.font.geartinkerbell)
+val hkFontFamily17 = clockFontFamily(R.font.googlesans)
+val hkFontFamily18 = clockFontFamily(R.font.harmonyos_sans)
+val hkFontFamily19 = clockFontFamily(R.font.intervariable)
+val hkFontFamily20 = clockFontFamily(R.font.jetbrainsmono)
+val hkFontFamily21 = clockFontFamily(R.font.lgsmartgothic)
+val hkFontFamily22 = clockFontFamily(R.font.linotte)
+val hkFontFamily23 = clockFontFamily(R.font.manrope)
+val hkFontFamily24 = clockFontFamily(R.font.montserrat)
+val hkFontFamily25 = clockFontFamily(R.font.ndot)
+val hkFontFamily26 = clockFontFamily(R.font.ndot57)
+val hkFontFamily27 = clockFontFamily(R.font.oneplusslate)
+val hkFontFamily28 = clockFontFamily(R.font.opposans)
+val hkFontFamily29 = clockFontFamily(R.font.opsans)
+val hkFontFamily30 = clockFontFamily(R.font.roboto)
+val hkFontFamily31 = clockFontFamily(R.font.rosemary)
+val hkFontFamily32 = clockFontFamily(R.font.samsungone)
+val hkFontFamily33 = clockFontFamily(R.font.slate_from_op)
+val hkFontFamily34 = clockFontFamily(R.font.sonysketch)
+val hkFontFamily35 = clockFontFamily(R.font.storopia)
+val hkFontFamily36 = clockFontFamily(R.font.surfer)
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -224,7 +261,9 @@ fun MainAppContainer() {
                     title = "Pocket Detection",
                     description = "Turn off display in pocket, wake when removed",
                     prefsKey = "pocket_detection_enabled",
-                    showSensitivity = false,
+                    showSensitivity = true,
+                    sensitivityTitle = "Proximity Sensitivity",
+                    sensitivityDescription = "How quickly and from how far the proximity sensor reacts. Higher values detect a cover sooner and from farther away.",
                     onBack = { navController.popBackStack() }
                 )
             }
@@ -1122,6 +1161,8 @@ fun FeatureSettingsScreen(
     description: String,
     prefsKey: String,
     showSensitivity: Boolean = false,
+    sensitivityTitle: String = "Sensitivity",
+    sensitivityDescription: String = "Adjust how quickly the sensor reacts",
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
@@ -1177,8 +1218,8 @@ fun FeatureSettingsScreen(
                     color = Color.White.copy(0.05f)
                 ) {
                     Column(modifier = Modifier.padding(20.dp)) {
-                        Text("Sensitivity", color = Color.White, fontSize = 18.sp)
-                        Text("Adjust how quickly the sensor reacts", color = Color.White.copy(0.6f), fontSize = 12.sp)
+                        Text(sensitivityTitle, color = Color.White, fontSize = 18.sp)
+                        Text(sensitivityDescription, color = Color.White.copy(0.6f), fontSize = 12.sp)
 
                         Slider(
                             value = sensitivity,
@@ -1245,13 +1286,13 @@ fun AmbientSettingsScreen(
     var notifications by remember { mutableStateOf(prefs.getBoolean("ambient_notifications", false)) }
     var mediaIntel by remember { mutableStateOf(prefs.getBoolean("ambient_media_intel", false)) }
     var mediaControls by remember { mutableStateOf(prefs.getBoolean("ambient_media_controls", false)) }
-    var volumeSteps by remember { mutableIntStateOf(prefs.getInt("volume_swipe_steps", 3)) }
+    val audioManager = remember { context.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
+    val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+    var volumeSteps by remember { mutableIntStateOf(prefs.getInt("volume_swipe_steps", (maxVolume / 3).coerceAtLeast(1)).coerceIn(1, maxVolume)) }
     var chargingSpeed by remember { mutableStateOf(prefs.getBoolean("ambient_charging_speed", false)) }
     var notificationIntel by remember { mutableStateOf(prefs.getBoolean("ambient_notification_intel", false)) }
     var callIntel by remember { mutableStateOf(prefs.getBoolean("ambient_call_intel", false)) }
     var clockSize by remember { mutableFloatStateOf(prefs.getFloat("clock_size", 80f)) }
-    var tapToShow by remember { mutableStateOf(prefs.getBoolean("ambient_tap_to_show", false)) }
-    var tapSensitivity by remember { mutableIntStateOf(prefs.getInt("tap_sensitivity", 100)) }
     var aodTimeout by remember { mutableIntStateOf(prefs.getInt("aod_timeout_seconds", 10)) }
     LaunchedEffect(Unit) {
         // Restores style, size and custom font from prefs.
@@ -1310,6 +1351,7 @@ fun AmbientSettingsScreen(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .verticalScroll(rememberScrollState())
                             .padding(horizontal = 24.dp)
                             .padding(bottom = 40.dp)
                     ) {
@@ -1370,54 +1412,6 @@ fun AmbientSettingsScreen(
                                 }
                             }
                         }
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            // ── Tap to Show ──
-            AmbientToggleCard(
-                label = "Tap to Show",
-                subtitle = "Single-tap the sleeping screen to show the AOD. Double-tap keeps the normal system behaviour — it wakes to the lock screen. Slight battery cost: the tap is sensed while the screen stays off.",
-                checked = tapToShow,
-                onCheckedChange = {
-                    tapToShow = it
-                    prefs.edit().putBoolean("ambient_tap_to_show", it).apply()
-                }
-            )
-
-            // ── Tap Sensitivity (only relevant for Tap to Show) ──
-            if (tapToShow) {
-                Spacer(modifier = Modifier.height(12.dp))
-                AmbientCard {
-                    Column(modifier = Modifier.padding(20.dp)) {
-                        Text("Tap Sensitivity", color = Color.White, fontSize = 16.sp)
-                        Text(
-                            text = "How firmly the sleeping screen must be tapped. Lower it if the AOD wakes on its own; raise it if taps are missed.",
-                            color = Color.White.copy(0.6f),
-                            fontSize = 12.sp
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = "$tapSensitivity%",
-                            color = Color.White.copy(0.6f),
-                            fontSize = 12.sp
-                        )
-                        Slider(
-                            value = tapSensitivity.toFloat(),
-                            onValueChange = {
-                                val snapped = ((it / 10f).roundToInt() * 10).coerceIn(50, 200)
-                                tapSensitivity = snapped
-                                prefs.edit().putInt("tap_sensitivity", snapped).apply()
-                            },
-                            valueRange = 50f..200f,
-                            steps = 14,
-                            colors = SliderDefaults.colors(
-                                thumbColor = HKAOD_Red,
-                                activeTrackColor = HKAOD_Red
-                            )
-                        )
                     }
                 }
             }
@@ -1637,18 +1631,12 @@ fun AmbientSettingsScreen(
                 Spacer(modifier = Modifier.height(12.dp))
 
                 // 5a. Volume swipe steps — controls how far you must
-                // drag to change volume (1 = coarse/fast, 5 = fine/precise)
+                // drag to change volume. Range matches system volume levels (1..maxVol).
                 AmbientCard {
                     Column(modifier = Modifier.padding(20.dp)) {
                         Text("Volume Swipe Steps", color = Color.White, fontSize = 16.sp)
                         Text(
-                            text = when (volumeSteps) {
-                                1 -> "Fast — big changes per swipe"
-                                2 -> "Quick — larger jumps"
-                                3 -> "Balanced — moderate steps"
-                                4 -> "Fine — precise control"
-                                else -> "Finest — smallest steps"
-                            },
+                            text = "System volume levels changed per full swipe: lower = fine/precise, higher = fast",
                             color = Color.White.copy(0.6f),
                             fontSize = 12.sp
                         )
@@ -1656,19 +1644,20 @@ fun AmbientSettingsScreen(
                         Slider(
                             value = volumeSteps.toFloat(),
                             onValueChange = {
-                                val snapped = it.roundToInt()
+                                val snapped = it.roundToInt().coerceIn(1, maxVolume)
                                 volumeSteps = snapped
                                 prefs.edit().putInt("volume_swipe_steps", snapped).apply()
                             },
-                            valueRange = 1f..5f,
-                            steps = 3,
+                            valueRange = 1f..maxVolume.toFloat(),
+                            // Slider `steps` = intermediate stops, so 1..max has max-2 of them
+                            steps = (maxVolume - 2).coerceAtLeast(0),
                             colors = SliderDefaults.colors(
                                 thumbColor = Color(0xFFEC6666),
                                 activeTrackColor = Color(0xFFEC6666)
                             )
                         )
                         Text(
-                            "$volumeSteps/5",
+                            "$volumeSteps / $maxVolume",
                             color = Color.Cyan,
                             modifier = Modifier.align(Alignment.End)
                         )

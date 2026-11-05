@@ -16,6 +16,37 @@ enum class ClockStyle(val label: String) {
     STYLE_5("High"),
     STYLE_6("Rocky"),
 
+    // Appended bundled-font presets (res/font). Alphabetical.
+    STYLE_7("Aclonica"),
+    STYLE_8("Amarante"),
+    STYLE_9("Bariol"),
+    STYLE_10("Cagliostro"),
+    STYLE_11("Comfortaa"),
+    STYLE_12("Comic Sans"),
+    STYLE_13("Coolstory"),
+    STYLE_14("Dot Matrix"),
+    STYLE_15("Fluid Sans"),
+    STYLE_16("Gear Tinkerbell"),
+    STYLE_17("Google Sans"),
+    STYLE_18("HarmonyOS Sans"),
+    STYLE_19("Inter"),
+    STYLE_20("JetBrains Mono"),
+    STYLE_21("LG Smart Gothic"),
+    STYLE_22("Linotte"),
+    STYLE_23("Manrope"),
+    STYLE_24("Montserrat"),
+    STYLE_25("Ndot"),
+    STYLE_26("Ndot 57"),
+    STYLE_27("OnePlus Slate"),
+    STYLE_28("OPPO Sans"),
+    STYLE_29("OP Sans"),
+    STYLE_30("Roboto"),
+    STYLE_31("Rosemary"),
+    STYLE_32("Samsung One"),
+    STYLE_33("Slate"),
+    STYLE_34("Sony Sketch"),
+    STYLE_35("Storopia"),
+    STYLE_36("Surfer"),
 }
 
 object ClockStyleRepository {
@@ -151,5 +182,35 @@ object ClockStyleRepository {
         ClockStyle.STYLE_4 -> hkFontFamily4
         ClockStyle.STYLE_5 -> hkFontFamily5
         ClockStyle.STYLE_6 -> hkFontFamily6
+        ClockStyle.STYLE_7 -> hkFontFamily7
+        ClockStyle.STYLE_8 -> hkFontFamily8
+        ClockStyle.STYLE_9 -> hkFontFamily9
+        ClockStyle.STYLE_10 -> hkFontFamily10
+        ClockStyle.STYLE_11 -> hkFontFamily11
+        ClockStyle.STYLE_12 -> hkFontFamily12
+        ClockStyle.STYLE_13 -> hkFontFamily13
+        ClockStyle.STYLE_14 -> hkFontFamily14
+        ClockStyle.STYLE_15 -> hkFontFamily15
+        ClockStyle.STYLE_16 -> hkFontFamily16
+        ClockStyle.STYLE_17 -> hkFontFamily17
+        ClockStyle.STYLE_18 -> hkFontFamily18
+        ClockStyle.STYLE_19 -> hkFontFamily19
+        ClockStyle.STYLE_20 -> hkFontFamily20
+        ClockStyle.STYLE_21 -> hkFontFamily21
+        ClockStyle.STYLE_22 -> hkFontFamily22
+        ClockStyle.STYLE_23 -> hkFontFamily23
+        ClockStyle.STYLE_24 -> hkFontFamily24
+        ClockStyle.STYLE_25 -> hkFontFamily25
+        ClockStyle.STYLE_26 -> hkFontFamily26
+        ClockStyle.STYLE_27 -> hkFontFamily27
+        ClockStyle.STYLE_28 -> hkFontFamily28
+        ClockStyle.STYLE_29 -> hkFontFamily29
+        ClockStyle.STYLE_30 -> hkFontFamily30
+        ClockStyle.STYLE_31 -> hkFontFamily31
+        ClockStyle.STYLE_32 -> hkFontFamily32
+        ClockStyle.STYLE_33 -> hkFontFamily33
+        ClockStyle.STYLE_34 -> hkFontFamily34
+        ClockStyle.STYLE_35 -> hkFontFamily35
+        ClockStyle.STYLE_36 -> hkFontFamily36
     }
 }

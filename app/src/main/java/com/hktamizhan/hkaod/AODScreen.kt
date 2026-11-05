@@ -18,6 +18,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
@@ -142,6 +143,7 @@ fun AODScreen(
     val chargingPos = AODPositions.read(prefs, "charging")
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var isCharging      by remember { mutableStateOf(false) }
+    var isPlugged       by remember { mutableStateOf(false) }
     var chargingWatts   by remember { mutableStateOf("") }
     var chargingLabel   by remember { mutableStateOf("") }
     var batteryLevel    by remember { mutableIntStateOf(0) }
@@ -153,6 +155,7 @@ fun AODScreen(
                 val level   = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
                 val scale   = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
                 val status  = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1)
 
                 // Instant level / charging-state update on plug, unplug or % change.
                 // The rate (W / mA), charging label and time estimates are computed in
@@ -160,112 +163,81 @@ fun AODScreen(
                 batteryLevel = if (scale > 0) (level * 100 / scale) else batteryLevel
                 isCharging   = status == BatteryManager.BATTERY_STATUS_CHARGING ||
                         status == BatteryManager.BATTERY_STATUS_FULL
+                isPlugged    = plugged > 0
             }
         }
         context.registerReceiver(receiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         onDispose { context.unregisterReceiver(receiver) }
     }
-    // Coulometer state for the delta-current fallback on devices that don't
-    // expose CURRENT_NOW / CURRENT_AVERAGE.
-    var prevCounter by remember { mutableStateOf(0L) }
-    var prevCounterTime by remember { mutableStateOf(0L) }
-    // Debug: log charging readings only when they change (avoids log spam).
-    var lastChargeSig by remember { mutableStateOf("") }
+
+    // Keeps the charge-counter anchor and unit detection between poll ticks.
+    val chargingReader = remember { ChargingIntelReader() }
 
     // Dynamic battery/charging poll — refreshes the live rate (W / mA), the
     // charging label, the charge ETA and the discharge estimate every second.
     LaunchedEffect(Unit) {
         while (true) {
             try {
-                val bm     = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
-                val sticky = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                val reading = chargingReader.read(context)
 
-                val level   = sticky?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-                val scale   = sticky?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
-                val status  = sticky?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
-                val plugged = sticky?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) ?: -1
-                var voltage = sticky?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0) ?: 0  // mV
+                batteryLevel = reading.levelPercent
+                isCharging   = reading.isCharging
+                isPlugged    = reading.isPlugged
 
-                val pct = if (scale > 0) level * 100 / scale else batteryLevel
-                batteryLevel = pct
-                val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
-                        status == BatteryManager.BATTERY_STATUS_FULL
-                isCharging = charging
-
-                // ── Live current (mA) ──
-                // CURRENT_NOW's sign convention differs across OEMs (some
-                // report positive while charging, others negative) and it can
-                // be 0 on devices that don't expose it. Normalise to a
-                // positive magnitude, then fall back to CURRENT_AVERAGE and
-                // finally to charge-counter deltas.
-                var currentMA = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW) / 1000f
-                if (abs(currentMA) < 50f) {
-                    val avg = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE) / 1000f
-                    if (abs(avg) >= 50f) currentMA = avg
-                }
-
-                val now = System.currentTimeMillis()
-                val chargeCounter = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER).toLong()
-                if (abs(currentMA) < 50f && chargeCounter > 0 && prevCounter > 0) {
-                    val dt = now - prevCounterTime
-                    if (dt in 300L..30_000L) {
-                        // µAh over dt ms → µA: ×3.6e6 / dt  (1 µAh = 3.6e6 µA·ms)
-                        val estUa = (chargeCounter - prevCounter) * 3_600_000L / dt
-                        val estMA = abs(estUa) / 1000f
-                        if (estMA in 50f..10_000f) currentMA = estMA
-                    }
-                }
-                prevCounter     = chargeCounter
-                prevCounterTime = now
-
-                // Sensor magnitude — meaningful for both charging and discharging.
-                val liveMA    = abs(currentMA)
-                val saneRate  = liveMA in 50f..10_000f        // ignore nonsense sensor reads
+                // Re-read the live settings so toggling them from the app is
+                // reflected without recreating the overlay.
+                showCharging = prefs.getBoolean("ambient_charging_speed", false)
                 val showWatts = prefs.getBoolean("charging_show_watts", true)
 
-                // Battery-side voltage. A few devices report no EXTRA_VOLTAGE —
-                // fall back to a typical charging voltage so watts still show.
-                if (voltage <= 0 && saneRate) voltage = 4000
-                val voltageV  = if (voltage > 0) voltage / 1000f else 0f
-
-                // Android has no public API for the system's negotiated charger
-                // rate or a system-provided "time until full", so the wattage
-                // and ETA are derived from the live current above.
-                val wattValue = if (saneRate) liveMA * voltageV / 1000f else 0f
-
-                if (charging) {
+                if (reading.isCharging || reading.isPlugged) {
+                    // Show the signed value while a charger is attached but the
+                    // battery is not actually charging, so a charger that can't
+                    // keep up ("leeching") is visible as negative wattage.
+                    val displayWatts = if (reading.isCharging) reading.watts else reading.signedWatts
                     chargingWatts = when {
-                        !saneRate        -> ""
-                        showWatts        -> "%.1f W".format(wattValue)
-                        else             -> "%.0f mA".format(liveMA)
+                        !reading.hasCurrent -> ""
+                        showWatts -> if (displayWatts < -0.05f) "%+.1f W".format(displayWatts)
+                                     else "%.1f W".format(displayWatts)
+                        else -> if (reading.signedCurrentMa < -0.5f)
+                            "%+.0f mA".format(reading.signedCurrentMa)
+                        else "%.0f mA".format(reading.currentMa)
                     }
+
                     // Charger-side wattage is not exposed by any public API, and
                     // battery watts are always lower than the charger's rating
                     // (an 18W charger puts ~4A ≈ 14W into the battery). The
                     // current actually flowing into the battery is the most
                     // consistent cross-device signal for the charge speed.
                     chargingLabel = when {
-                        plugged == BatteryManager.BATTERY_PLUGGED_WIRELESS -> "Wireless Charging"
-                        liveMA >= 5000f -> "Super Fast Charging"
-                        liveMA >= 2500f -> "Fast Charging"
-                        liveMA >= 1000f -> "Charging"
-                        else            -> "Slow Charging"
+                        reading.isDrainingWhilePlugged -> "Charger not keeping up"
+                        !reading.isCharging -> "Charger connected · not charging"
+                        reading.plugged == BatteryManager.BATTERY_PLUGGED_WIRELESS -> "Wireless Charging"
+                        reading.currentMa >= 5000f -> "Super Fast Charging"
+                        reading.currentMa >= 2500f -> "Fast Charging"
+                        reading.currentMa >= 1000f -> "Charging"
+                        else                       -> "Slow Charging"
                     }
+
                     // Estimated time until full = remaining capacity ÷ live current.
                     remainingTime = when {
-                        pct >= 100    -> "Fully charged"
-                        !saneRate || chargeCounter <= 0 || pct !in 1..99 -> ""
+                        !reading.isCharging -> ""
+                        reading.levelPercent >= 100 -> "Fully charged"
+                        !reading.hasCurrent || reading.currentMa < 20f -> ""
+                        reading.chargeCounterUah <= 0L || reading.levelPercent !in 1..99 -> ""
                         else -> {
-                            val fullUah      = chargeCounter * 100L / pct
-                            val remainingUah = (fullUah - chargeCounter).coerceAtLeast(0L)
+                            val counter = reading.chargeCounterUah
+                            val pct     = reading.levelPercent
+                            val fullUah      = counter * 100L / pct
+                            val remainingUah = (fullUah - counter).coerceAtLeast(0L)
                             val remainingMah = remainingUah / 1000L
                             if (remainingMah > 20_000L) {
                                 ""  // absurd extrapolation → sensor noise
                             } else {
-                                val hoursToFull = remainingUah.toFloat() / (liveMA * 1000f)
+                                val hoursToFull = remainingUah.toFloat() / (reading.currentMa * 1000f)
                                 val hh = hoursToFull.toInt()
                                 val mm = ((hoursToFull - hh) * 60).toInt()
                                 when {
+                                    hoursToFull > 500f -> ""
                                     hh > 0 -> "${hh}h ${mm}m until full"
                                     mm > 0 -> "${mm}m until full"
                                     else   -> ""
@@ -290,12 +262,13 @@ fun AODScreen(
                             }
                         } else ""
                     } else {
-                        val chargeCounter = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
-                        if (saneRate && chargeCounter > 0) {
-                            val hoursLeft = chargeCounter.toFloat() / (liveMA * 1000f)
+                        if (reading.hasCurrent && reading.chargeCounterUah > 0) {
+                            val hoursLeft = reading.chargeCounterUah.toFloat() /
+                                    (reading.currentMa * 1000f)
                             val hh = hoursLeft.toInt()
                             val mm = ((hoursLeft - hh) * 60).toInt()
                             when {
+                                hoursLeft > 500f -> ""
                                 hh > 0 -> "${hh}h ${mm}m left"
                                 mm > 0 -> "${mm}m left"
                                 else   -> ""
@@ -303,19 +276,9 @@ fun AODScreen(
                         } else ""
                     }
                 }
-
-                // Helps diagnosing device-specific charging readings via
-                // `adb logcat -s HKAOD` — only logs when something changes.
-                val debugSig = "$status|$plugged|$voltage|$currentMA|$chargingLabel"
-                if (debugSig != lastChargeSig) {
-                    lastChargeSig = debugSig
-                    Log.d(
-                        "HKAOD",
-                        "Charging: status=$status plugged=$plugged voltage=${voltage}mV " +
-                                "raw=${currentMA}mA live=${liveMA}mA watts=$wattValue label=$chargingLabel"
-                    )
-                }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.w("HKAOD", "Charging Intel poll failed: ${e.message}")
+            }
             delay(1000L)
         }
     }
@@ -374,8 +337,20 @@ fun AODScreen(
                 }
             }
             .pointerInput(Unit) {
-                // Single tap only — double taps are left to the system.
-                detectTapGestures(onTap = { startDismiss = true })
+                // Double tap dismisses the AOD; a single tap does nothing.
+                // Use our own 700 ms window instead of Compose's short system
+                // double-tap timeout — injected and deliberate taps can be
+                // slightly slower than 300 ms.
+                var lastTapAt = 0L
+                detectTapGestures(onTap = {
+                    val now = SystemClock.uptimeMillis()
+                    if (lastTapAt > 0L && now - lastTapAt <= 700L) {
+                        lastTapAt = 0L
+                        startDismiss = true
+                    } else {
+                        lastTapAt = now
+                    }
+                })
             }
     ) {
         // Clock
@@ -486,7 +461,7 @@ fun AODScreen(
         // Charging / Battery
         if (showCharging && chargingPos.visible) {
             AODPlacedElement(pos = chargingPos, containerPx = containerSize) {
-                if (isCharging) {
+                if (isCharging || isPlugged) {
                     AODChargingRow(
                         level  = batteryLevel,
                         watts  = chargingWatts,
@@ -791,10 +766,12 @@ fun AODMediaControlsRow(
     val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
     val swipeSteps = remember {
         context.getSharedPreferences("HKAOD_PREFS", Context.MODE_PRIVATE)
-            .getInt("volume_swipe_steps", 3)
+            .getInt("volume_swipe_steps", (maxVol / 3).coerceAtLeast(1))
+            .coerceIn(1, maxVol)
     }
-    // More steps = finer control = more drag needed per level change
-    val swipeDivisor = 80f + swipeSteps * 40f
+    // swipeSteps = number of system volume levels changed per full swipe
+    // (a 300dp horizontal drag), range 1..system max volume.
+    val levelsPerSwipeFraction = swipeSteps.toFloat() / maxVol
 
     var currentVol by remember { mutableIntStateOf(audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)) }
     var showSlider by remember { mutableStateOf(false) }
@@ -928,7 +905,9 @@ fun AODMediaControlsRow(
                         },
                         onDrag = { change, dragAmount ->
                             change.consume()
-                            sliderProgress = (sliderProgress + dragAmount.x / swipeDivisor)
+                            val fullSwipePx = 300.dp.toPx()
+                            sliderProgress = (sliderProgress +
+                                    dragAmount.x / fullSwipePx * levelsPerSwipeFraction)
                                 .coerceIn(0f, 1f)
                             val newVol = (sliderProgress * maxVol).toInt().coerceIn(0, maxVol)
                             audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, newVol, 0)
@@ -955,17 +934,16 @@ fun AODMediaControlsRow(
 @Composable
 fun AODOverlayScreen(
     isAlwaysOn: Boolean,
-    lockOnTimeout: Boolean = true,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
 
-    // The overlay is created when the screen turns off (Always-On mode) or by a
-    // wake gesture (non-always-on mode). The auto-dismiss timer must only run
-    // while the display is actually ON — otherwise the overlay would lock and
-    // remove itself seconds after screen-off, long before a lift / wave / shake
-    // gesture ever wakes the screen, so the gesture would reveal the plain lock
-    // screen instead of the AOD.
+    // The overlay is created when the screen turns off (Always-On mode) or by
+    // a wake gesture / default double tap (non-always-on mode). The
+    // auto-dismiss timer must only run while the display is actually ON —
+    // otherwise the overlay would remove itself seconds after screen-off,
+    // long before a lift / wave / shake gesture ever wakes the screen, so the
+    // gesture would reveal the plain lock screen instead of the AOD.
     var displayOn by remember { mutableStateOf(isDisplayOn(context)) }
     var interactionKey by remember { mutableIntStateOf(0) }
 
@@ -993,9 +971,9 @@ fun AODOverlayScreen(
     }
 
     // Auto-dismiss after the user-configured AOD timeout (Ambient Settings);
-    // any touch resets the timer. Non-always-on gesture mode additionally locks
-    // the device so the display returns to sleep; "Tap to Show" only dismisses
-    // (see lockOnTimeout), which reveals the normal lock screen.
+    // any touch resets the timer. The AOD only dismisses — it never locks the
+    // device — because it may have been opened by a glance gesture or the
+    // default double tap.
     val timeoutMs = remember {
         (context.getSharedPreferences("HKAOD_PREFS", Context.MODE_PRIVATE)
             .getInt("aod_timeout_seconds", 10) * 1000L).coerceAtLeast(2_000L)
@@ -1003,7 +981,6 @@ fun AODOverlayScreen(
     LaunchedEffect(isAlwaysOn, displayOn, interactionKey) {
         if (!isAlwaysOn && displayOn) {
             delay(timeoutMs)
-            if (lockOnTimeout) AODService.getService()?.lockDevice()
             onDismiss()
         }
     }
