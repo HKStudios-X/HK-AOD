@@ -67,19 +67,28 @@ class AODService : AccessibilityService(), SensorEventListener {
         // Used by "Call Intel" on the AOD to show a "Missed call" line.
         val missedCallAt = MutableStateFlow(0L)
 
-        // Double-Tap-to-Show: minimum accelerometer impulse (m/s²) for a
-        // finger tap on the phone to count. Fixed — the old sensitivity slider
-        // has been removed.
-        const val TAP_SPIKE_BASE = 1.15f
+        // Tap-to-Show: minimum accelerometer impulse (m/s², 3-axis) for a
+        // finger tap on the phone to count. At 200 Hz the real peak of a tap
+        // is captured (at the old 50 Hz most of it fell between samples, so a
+        // higher 1.15 threshold was needed and many taps were missed).
+        const val TAP_SPIKE_BASE = 0.85f
 
-        // Two taps must land inside this window to count as a double tap.
-        // A single tap never wakes the screen, so it cannot conflict with the
-        // normal single-tap interactions on the lock screen.
-        const val DOUBLE_TAP_WINDOW_MS = 520L
+        // Below this the phone counts as resting (sensor noise ≈ 0.02).
+        const val TAP_QUIET_LEVEL = 0.25f
 
-        // Extra taps right after a confirmed double tap are ignored for this
-        // long, so a third tap cannot start a new pair and wake again.
-        const val DOUBLE_TAP_IGNORE_MS = 700L
+        // The phone must rest this long before a tap is accepted, so
+        // handling / carrying the phone is not mistaken for a tap.
+        const val TAP_MIN_QUIET_MS = 80L
+
+        // Baseline time-constant for the tap detector.
+        const val TAP_BASELINE_TAU_MS = 150f
+
+        // Accelerometer sampling period: 200 Hz.
+        const val ACCEL_SAMPLING_US = 5_000
+
+        // Further taps right after a tap wake are ignored for this long so
+        // the ringing of one tap (or a quick second tap) can't wake again.
+        const val TAP_IGNORE_MS = 1500L
     }
 
     // ─── Sensors ─────────────────────────────────────────────────
@@ -119,6 +128,21 @@ class AODService : AccessibilityService(), SensorEventListener {
     // ─── Wake Lock (for screen wake) ─────────────────────────────
     private var wakeLock: PowerManager.WakeLock? = null
 
+    // Most phones (e.g. Galaxy A50) only have a *non-wake-up* accelerometer:
+    // once the CPU suspends after screen-off it stops delivering samples, so
+    // tap / lift / shake would never be detected. While the display is off
+    // and one of those gestures is enabled, a partial wake lock keeps the CPU
+    // running. (The proximity sensor is a wake-up sensor, so wave/pocket
+    // don't need this.)
+    private var cpuWakeLock: PowerManager.WakeLock? = null
+
+    // Samsung's own AOD runs as a "dream": on screen timeout DREAMING_STARTED
+    // fires first and SCREEN_OFF only ~1–1.5 s later. A gesture inside that
+    // gap wakes the screen, then the late SCREEN_OFF used to tear the new AOD
+    // down (screen blinked → plain lock screen). Remember when a gesture woke
+    // the screen so that late SCREEN_OFF can be recognised and undone once.
+    private var lastGestureWakeAt = 0L
+
     // ─── Telephony ───────────────────────────────────────────────
     private var telephonyManager:   android.telephony.TelephonyManager? = null
     private var phoneStateListener: android.telephony.PhoneStateListener? = null
@@ -128,17 +152,16 @@ class AODService : AccessibilityService(), SensorEventListener {
     private var overlayView:           android.view.View? = null
     private var overlayLifecycleOwner: OverlayLifecycleOwner? = null
 
-    // ─── Double-Tap-to-Show state ─────────────────────────────────
+    // ─── Tap-to-Show state ────────────────────────────────────────
     // A switched-off screen cannot report touches to an app, so taps are
     // recognised from the small shocks they send through the phone: with the
     // display off and the phone at rest, a sharp, short spike in the
-    // accelerometer magnitude counts as a tap. Two spikes inside
-    // DOUBLE_TAP_WINDOW_MS show the AOD; a single tap does nothing.
-    private val tapHandler = Handler(Looper.getMainLooper())
-    private var firstTapResetRunnable: Runnable? = null
-    private var firstTapAt          = 0L       // first tap of a double tap
-    private var lastDoubleTapAt     = 0L       // debounce after a confirmed double tap
-    private var tapBaseline         = GRAVITY  // low-pass filtered magnitude
+    // accelerometer magnitude counts as a tap. A single tap shows the AOD.
+    private var lastTapWakeAt       = 0L       // debounce after a tap wake
+    private var tapBx               = 0f       // per-axis low-pass baseline
+    private var tapBy               = 0f
+    private var tapBz               = 0f
+    private var tapLastTs           = 0L       // last sample timestamp (ns); 0 = reseed
     private var tapQuietSince       = 0L       // when the phone last settled
     private var lastTapSpikeAt      = 0L       // last accepted spike time
     private var displayInteractive  = true     // kept in sync with screen broadcasts
@@ -175,18 +198,33 @@ class AODService : AccessibilityService(), SensorEventListener {
                     Log.d("HKAOD", "── SCREEN OFF ──")
                     displayInteractive = false
                     isDreaming = false
-                    resetSensorState()
-                    checkAndStartAODLogic()
+                    val sinceGesture = System.currentTimeMillis() - lastGestureWakeAt
+                    if (lastGestureWakeAt > 0L && sinceGesture < 3_000L) {
+                        // Late SCREEN_OFF racing a gesture wake (see
+                        // lastGestureWakeAt) — keep the AOD and wake once more.
+                        Log.d("HKAOD", "SCREEN OFF ${sinceGesture}ms after gesture wake — re-waking AOD")
+                        lastGestureWakeAt = 0L
+                        resetSensorState()
+                        registerSensors()
+                        acquireDisplayWake()
+                        startAODOverlay(force = true)
+                    } else {
+                        lastGestureWakeAt = 0L
+                        resetSensorState()
+                        checkAndStartAODLogic()
+                    }
+                    updateCpuWakeLock()
                 }
 
                 Intent.ACTION_DREAMING_STARTED -> {
                     // Device entered daydream mode (e.g., "Stay awake" while charging).
                     // Treat this like screen-off for AOD purposes: show overlay, register sensors.
                     Log.d("HKAOD", "── DREAMING STARTED ──")
+                    resetSensorState()
                     isDreaming = true
                     displayInteractive = false
-                    resetSensorState()
                     checkAndStartAODLogic()
+                    updateCpuWakeLock()
                 }
 
                 Intent.ACTION_DREAMING_STOPPED -> {
@@ -200,44 +238,86 @@ class AODService : AccessibilityService(), SensorEventListener {
                     }
                     resetSensorState()
                     registerSensors()
+                    updateCpuWakeLock()
                 }
 
                 Intent.ACTION_SCREEN_ON -> {
-                    // Display woke (double tap, power button or a gesture).
-                    // Always-On mode keeps its overlay alive. On our double
-                    // tap the system's own tap-to-wake can turn the display on
-                    // before the second accelerometer sample arrives, so if a
-                    // first tap is still pending, treat this wake as the
-                    // second tap and show the AOD (the default behaviour).
-                    // Any other wake (power button, lift) still goes to the
-                    // lock screen — the AOD is shown by our own detector.
-                    Log.d("HKAOD", "── SCREEN ON — sensors ready ──")
-                    val tapAt = firstTapAt
-                    val tapNow = System.currentTimeMillis()
-                    if (tapAt > 0L && tapNow - tapAt in 100L..DOUBLE_TAP_WINDOW_MS) {
-                        firstTapAt = 0L
-                        lastDoubleTapAt = tapNow
-                        Log.d("HKAOD", "System double-tap wake detected → showing AOD")
-                        startAODOverlay()
-                    }
+                    // Display woke (tap, power button or a gesture).
+                    // Always-On mode keeps its overlay alive — but only while
+                    // the device is locked (startAODOverlay checks this), so
+                    // devices without a secure lock screen never get the AOD
+                    // drawn over the home screen.
+                    Log.d("HKAOD", "── SCREEN ON ──")
                     displayInteractive = true
                     val prefs = getSharedPreferences("HKAOD_PREFS", MODE_PRIVATE)
                     if (prefs.getBoolean("ambient_enabled", false)) {
                         startAODOverlay()
                     }
-                    // Double-tap-to-show is always on; keep sensing ready for
-                    // the next screen-off cycle.
                     resetSensorState()
-                    registerSensors()
+                    if (isKeyguardLocked()) {
+                        registerSensors()
+                    } else {
+                        // Not locked (lock-delay grace period, smart lock or
+                        // no lock screen): stop the gesture sensors so nothing
+                        // pops the AOD up while the phone is in use. The
+                        // overlay a gesture just showed is left alone — it
+                        // closes on its timeout or on USER_PRESENT.
+                        stopSensors()
+                    }
+                    updateCpuWakeLock()
                 }
 
                 Intent.ACTION_USER_PRESENT -> {
                     // Device fully unlocked — remove AOD
                     Log.d("HKAOD", "── USER PRESENT — removing AOD ──")
+                    lastGestureWakeAt = 0L
                     removeAODOverlay()
                     stopSensors()
+                    updateCpuWakeLock()
                 }
             }
+        }
+    }
+
+    // ─── Battery drain learning (time-remaining estimate) ────────
+    private val batteryReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val level = intent.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1)
+            val scale = intent.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1)
+            val plugged = intent.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) > 0
+            if (level < 0 || scale <= 0) return
+            BatteryDrainTracker.onBatteryChanged(context, level * 100 / scale, plugged)
+        }
+    }
+
+    // ─── CPU wake lock for accelerometer gestures ────────────────
+    private fun needsAccelerometerWhileOff(): Boolean {
+        val prefs = getSharedPreferences("HKAOD_PREFS", MODE_PRIVATE)
+        return prefs.getBoolean("tap_enabled", true) ||
+            prefs.getBoolean("lift_enabled", false) ||
+            prefs.getBoolean("shake_enabled", false)
+    }
+
+    // Held only while the display is off, sensors are running and an
+    // accelerometer gesture is enabled. Re-evaluated on every screen change.
+    private fun updateCpuWakeLock() {
+        val want = !displayInteractive && sensorsRegistered && needsAccelerometerWhileOff()
+        val held = cpuWakeLock?.isHeld == true
+        if (want && !held) {
+            try {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                val wl = cpuWakeLock ?: pm.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK, "hkaod:gestures"
+                ).also { it.setReferenceCounted(false); cpuWakeLock = it }
+                // Safety cap; renewed on the next screen-off.
+                wl.acquire(4 * 60 * 60 * 1000L)
+                Log.d("HKAOD", "CPU wake lock acquired (accelerometer gestures)")
+            } catch (e: Exception) {
+                Log.w("HKAOD", "CPU wake lock failed: ${e.message}")
+            }
+        } else if (!want && held) {
+            try { cpuWakeLock?.release() } catch (_: Exception) {}
+            Log.d("HKAOD", "CPU wake lock released")
         }
     }
 
@@ -249,13 +329,27 @@ class AODService : AccessibilityService(), SensorEventListener {
         lastShakeWave      = 0L
         wasMoving          = false
         isDreaming         = false
-        // Double-Tap-to-Show — a fresh settle is required after every screen change.
-        resetTapState()
-        tapBaseline     = GRAVITY
+        // Tap-to-Show — a fresh settle is required after every screen change.
+        tapLastTs       = 0L
         tapQuietSince   = 0L
         lastTapSpikeAt  = 0L
-        lastDoubleTapAt = 0L
+        lastTapWakeAt   = 0L
     }
+
+    // ─── Lock state ──────────────────────────────────────────────
+    private fun isKeyguardLocked(): Boolean = try {
+        (getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager).isKeyguardLocked
+    } catch (_: Exception) { true }
+
+    private fun isDisplayInteractive(): Boolean = try {
+        (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive
+    } catch (_: Exception) { true }
+
+    // The AOD may only appear while the display is off or the lock screen is
+    // up. Once the user has unlocked and is using the phone it must never
+    // show (that was the "AOD pops up randomly while unlocked" bug — a lift,
+    // shake, wave or Always-On screen-on could draw it over any app).
+    private fun canShowAOD(): Boolean = !isDisplayInteractive() || isKeyguardLocked()
 
     // Full pocket-state reset — only on service (re)connect. The pocket state
     // itself must survive screen transitions: the phone stays covered even
@@ -300,21 +394,40 @@ class AODService : AccessibilityService(), SensorEventListener {
         pocketConfirmRunnable = null
     }
 
-    // ─── Double-Tap-to-Show detection ─────────────────────────────
+    // ─── Tap-to-Show detection ────────────────────────────────────
     // Runs on accelerometer samples while the display is off. The phone must
     // have settled first (tapQuietSince), then a finger tap must produce a
-    // sharp impulse above the fixed threshold. A single tap is remembered for
-    // DOUBLE_TAP_WINDOW_MS; only a second tap inside that window shows the AOD.
-    // wakeScreen() is called immediately on the second tap — no delayed
-    // confirmation — so the system's own double-tap wake (if enabled) races
-    // with us instead of pre-empting the AOD.
-    private fun handleTapDetection(magnitude: Float, now: Long) {
-        // Low-pass baseline ≈ the phone's current rest level. Taps are brief,
-        // so they barely move it and stand out as an impulse.
-        tapBaseline += (magnitude - tapBaseline) * 0.12f
-        val impulse = abs(magnitude - tapBaseline)
+    // sharp impulse above the fixed threshold. A single tap wakes the screen
+    // and shows the AOD immediately.
+    //
+    // The impulse is measured on the full 3-axis vector against a slow
+    // per-axis baseline (time-constant TAP_BASELINE_TAU_MS). Using only the
+    // magnitude missed taps whose shock is mostly sideways — with the phone
+    // flat, a lateral jolt barely changes |a|.
+    private fun handleTapDetection(x: Float, y: Float, z: Float, now: Long, tsNanos: Long) {
+        if (tapLastTs == 0L) {
+            // First sample after (re)start — seed the baseline with it instead
+            // of 9.8, otherwise the first ~200 ms read as one long "shock".
+            tapBx = x; tapBy = y; tapBz = z
+            tapLastTs = tsNanos
+            tapQuietSince = now
+            return
+        }
+        val dtMs = ((tsNanos - tapLastTs) / 1_000_000f).coerceIn(0.5f, 100f)
+        tapLastTs = tsNanos
 
-        if (impulse < 0.22f) {
+        val dx = x - tapBx
+        val dy = y - tapBy
+        val dz = z - tapBz
+        val impulse = sqrt(dx * dx + dy * dy + dz * dz)
+
+        // Time-based low-pass, so it behaves the same at any sample rate.
+        val alpha = 1f - kotlin.math.exp(-dtMs / TAP_BASELINE_TAU_MS)
+        tapBx += dx * alpha
+        tapBy += dy * alpha
+        tapBz += dz * alpha
+
+        if (impulse < TAP_QUIET_LEVEL) {
             if (tapQuietSince == 0L) tapQuietSince = now
             return
         }
@@ -322,53 +435,29 @@ class AODService : AccessibilityService(), SensorEventListener {
         val quietFor = if (tapQuietSince != 0L) now - tapQuietSince else 0L
         tapQuietSince = 0L
 
-        // Ignore extra taps just after a confirmed double tap so a third tap
-        // cannot immediately start a new pair and wake the screen again.
-        if ((now - lastDoubleTapAt) <= DOUBLE_TAP_IGNORE_MS) return
+        // Ignore further taps just after a tap wake.
+        if ((now - lastTapWakeAt) <= TAP_IGNORE_MS) return
 
-        // The phone only needs a short settle after the previous shock before
-        // another tap can be accepted. 200 ms was too strict for a natural
-        // quick double tap.
-        if (impulse <= TAP_SPIKE_BASE || quietFor < 60L || (now - lastTapSpikeAt) <= 100L) {
+        // The phone must have been resting (not handled / carried) just before
+        // the shock, and one tap's ringing must not count twice.
+        if (quietFor < TAP_MIN_QUIET_MS || (now - lastTapSpikeAt) <= 120L) return
+
+        if (impulse <= TAP_SPIKE_BASE) {
+            // Logged so the threshold can be tuned from real taps.
+            if (impulse >= 0.45f) {
+                Log.d("HKAOD", "Tap too weak (impulse=%.2f, need >%.2f)".format(impulse, TAP_SPIKE_BASE))
+            }
             return
         }
 
         lastTapSpikeAt = now
-        val sinceFirstTap = if (firstTapAt > 0L) now - firstTapAt else Long.MAX_VALUE
-
-        if (firstTapAt > 0L && sinceFirstTap in 100L..DOUBLE_TAP_WINDOW_MS) {
-            // ── Second tap: this is a double tap — wake immediately ──
-            firstTapAt = 0L
-            lastDoubleTapAt = now
-            firstTapResetRunnable?.let { tapHandler.removeCallbacks(it) }
-            firstTapResetRunnable = null
-            if (isCovered) {
-                Log.d("HKAOD", "Double tap: pocketed — ignored")
-            } else {
-                Log.d(
-                    "HKAOD",
-                    "Double tap (impulse=%.2f, gap=${sinceFirstTap}ms) → showing AOD".format(impulse)
-                )
-                wakeScreen()
-            }
+        lastTapWakeAt  = now
+        if (isCovered) {
+            Log.d("HKAOD", "Tap: pocketed — ignored")
         } else {
-            // ── First tap: wait for the second; a lone tap never wakes ──
-            firstTapAt = now
-            firstTapResetRunnable?.let { tapHandler.removeCallbacks(it) }
-            val reset = Runnable {
-                firstTapAt = 0L
-                firstTapResetRunnable = null
-            }
-            firstTapResetRunnable = reset
-            tapHandler.postDelayed(reset, DOUBLE_TAP_WINDOW_MS + 50L)
-            Log.d("HKAOD", "First tap recorded (impulse=%.2f) — waiting for second".format(impulse))
+            Log.d("HKAOD", "Single tap (impulse=%.2f) → showing AOD".format(impulse))
+            wakeScreen()
         }
-    }
-
-    private fun resetTapState() {
-        firstTapResetRunnable?.let { tapHandler.removeCallbacks(it) }
-        firstTapResetRunnable = null
-        firstTapAt = 0L
     }
 
     // ─── Wake Screen ─────────────────────────────────────────────
@@ -380,6 +469,29 @@ class AODService : AccessibilityService(), SensorEventListener {
     // display off and the next SCREEN_OFF cycle restarts the AOD.
     @Suppress("DEPRECATION")
     private fun wakeScreen() {
+        // Never wake into the AOD while the phone is unlocked and in use.
+        // Decided before the wake lock, because once the display is on the
+        // keyguard may still be unlocked during the lock-delay grace period.
+        if (!canShowAOD()) {
+            Log.d("HKAOD", "wakeScreen ignored — device unlocked and in use")
+            return
+        }
+        // Gestures are glance gestures: they only act while the display is
+        // off (or in Samsung's AOD dream). With the lock screen already on,
+        // picking the phone up to unlock must not throw the AOD over it.
+        if (displayInteractive) {
+            Log.d("HKAOD", "wakeScreen ignored — display already on")
+            return
+        }
+        lastGestureWakeAt = System.currentTimeMillis()
+        acquireDisplayWake()
+        // A gesture must always reveal the AOD, even if the overlay timed out
+        // earlier. startAODOverlay() no-ops when the overlay is already up.
+        startAODOverlay(force = true)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun acquireDisplayWake() {
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             val wl = pm.newWakeLock(
@@ -402,9 +514,6 @@ class AODService : AccessibilityService(), SensorEventListener {
         } catch (e: Exception) {
             Log.e("HKAOD", "WakeLock failed: ${e.message}")
         }
-        // A gesture must always reveal the AOD, even if the overlay timed out
-        // earlier. startAODOverlay() no-ops when the overlay is already up.
-        startAODOverlay()
     }
 
     // ─── Lifecycle ────────────────────────────────────────────────
@@ -475,6 +584,7 @@ class AODService : AccessibilityService(), SensorEventListener {
             addAction(Intent.ACTION_DREAMING_STOPPED)
         }
         registerReceiver(screenStateReceiver, filter)
+        registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         displayInteractive = try {
             (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive
         } catch (_: Exception) { true }
@@ -497,7 +607,11 @@ class AODService : AccessibilityService(), SensorEventListener {
         // If not interactive, or if charging but screen dimmed (dreaming), start AOD logic
         if (!isInteractive) {
             checkAndStartAODLogic()
-        } else {
+            updateCpuWakeLock()
+        } else if (isKeyguardLocked()) {
+            // Screen on at the lock screen — be ready for gestures.
+            // When already unlocked, sensors stay off until the next
+            // screen-off so nothing can pop the AOD up while in use.
             registerSensors()
         }
 
@@ -511,7 +625,9 @@ class AODService : AccessibilityService(), SensorEventListener {
         telephonyManager?.listen(phoneStateListener, android.telephony.PhoneStateListener.LISTEN_NONE)
         AODKeepAliveService.stop(this)
         stopSensors()
+        try { if (cpuWakeLock?.isHeld == true) cpuWakeLock?.release() } catch (_: Exception) {}
         try { unregisterReceiver(screenStateReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(batteryReceiver) } catch (_: Exception) {}
         instance = null
     }
 
@@ -519,9 +635,26 @@ class AODService : AccessibilityService(), SensorEventListener {
     override fun onInterrupt() {}
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
+    // Device admin lockNow() is the reliable way to turn the display off
+    // (especially on Samsung); the accessibility lock action is the fallback
+    // when the user has not activated the device admin.
     fun lockDevice() {
-        Log.d("HKAOD", "lockDevice called")
-        performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            Log.d("HKAOD", "lockDevice → accessibility GLOBAL_ACTION_LOCK_SCREEN")
+            performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
+        }
+    }
+
+    // Called when a gesture-woken AOD times out. Removes the overlay and,
+    // while still on the lock screen, turns the display back off — so a
+    // glance gesture ends with the screen off instead of a bright lock screen.
+    // Never locks a phone that is unlocked (lock-delay grace period).
+    fun onAODTimeout() {
+        removeAODOverlay()
+        if (isDisplayInteractive() && isKeyguardLocked()) {
+            Log.d("HKAOD", "AOD timeout → screen off")
+            lockDevice()
+        }
     }
 
     private fun isInCall(): Boolean {
@@ -580,7 +713,9 @@ class AODService : AccessibilityService(), SensorEventListener {
         // the brief peak of a shake/lift falls between samples and is missed.
         // It is always registered because double-tap-to-show is always active.
         accelerometer?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+            // 200 Hz: a finger tap is a 5–15 ms shock, which the old
+            // SENSOR_DELAY_GAME (20 ms) mostly sampled past.
+            sensorManager.registerListener(this, it, ACCEL_SAMPLING_US)
         }
         // Proximity is only needed when a proximity-based gesture is enabled.
         val prefs = getSharedPreferences("HKAOD_PREFS", MODE_PRIVATE)
@@ -602,9 +737,6 @@ class AODService : AccessibilityService(), SensorEventListener {
         // measurement so a stale near event can't confirm a "pocket" later.
         cancelPocketConfirmation()
         nearStartTime = 0L
-        // A pending first tap must not pair with a stale tap after the
-        // sensors were stopped (incoming call, unlock, service teardown).
-        resetTapState()
         sensorManager.unregisterListener(this)
         sensorsRegistered = false
         Log.d("HKAOD", "Sensors stopped")
@@ -680,7 +812,6 @@ class AODService : AccessibilityService(), SensorEventListener {
                         lastPocketStateChangeTime = now
                         Log.d("HKAOD", "Pocket released — waking screen + AOD")
                         wakeScreen()
-                        startAODOverlay()
                     }
                 } else if (isCovered) {
                     // Pocket detection is off now — just drop the stale state.
@@ -716,8 +847,8 @@ class AODService : AccessibilityService(), SensorEventListener {
             // Always on — the old setting was removed. Only meaningful while
             // the display is really off, and skipped in a confirmed pocket
             // (nothing to see in there).
-            if (!displayInteractive && !isCovered) {
-                handleTapDetection(magnitude, now)
+            if (!displayInteractive && !isCovered && prefs.getBoolean("tap_enabled", true)) {
+                handleTapDetection(x, y, z, now, event.timestamp)
             }
 
             // ── Lift to Wake Screen ──
@@ -756,7 +887,9 @@ class AODService : AccessibilityService(), SensorEventListener {
                 val shakeSens = prefs.getFloat("shake_enabled_sens", 3f).coerceIn(1f, 5f)
                 val shakeMoving = abs(magnitude - GRAVITY) > (2.8f - shakeSens * 0.3f)
 
-                if (shakeMoving && !wasMoving) {
+                // At 200 Hz the magnitude can jitter across the threshold
+                // within one swing — require 120 ms between counted waves.
+                if (shakeMoving && !wasMoving && (now - lastShakeWave) >= 120L) {
                     // New wave — restart the burst counter if it went stale
                     if (shakeWaveCount == 0 || (now - lastShakeWave) > 900L) {
                         shakeWaveCount = 1
@@ -779,7 +912,13 @@ class AODService : AccessibilityService(), SensorEventListener {
     }
 
     // ─── Overlay Start ───────────────────────────────────────────
-    fun startAODOverlay() {
+    // `force` is used only by wakeScreen(), which already checked
+    // canShowAOD() before turning the display on.
+    fun startAODOverlay(force: Boolean = false) {
+        if (!force && !canShowAOD()) {
+            Log.d("HKAOD", "startAODOverlay skipped — device unlocked")
+            return
+        }
         Handler(Looper.getMainLooper()).post {
             if (overlayView != null) {
                 Log.d("HKAOD", "Overlay already showing — skip")
@@ -833,7 +972,8 @@ class AODService : AccessibilityService(), SensorEventListener {
                 setContent {
                     AODOverlayScreen(
                         isAlwaysOn    = isAlwaysOn,
-                        onDismiss     = { removeAODOverlay() }
+                        onDismiss     = { removeAODOverlay() },
+                        onTimeout     = { onAODTimeout() }
                     )
                 }
             }

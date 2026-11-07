@@ -267,6 +267,9 @@ fun MainAppContainer() {
                     onBack = { navController.popBackStack() }
                 )
             }
+            composable("dev_profile_screen") {
+                DevProfileScreen(onBack = { navController.popBackStack() })
+            }
             composable("ambient_settings_screen") {
                 AmbientSettingsScreen(
                     onBack = { navController.popBackStack() },
@@ -368,6 +371,9 @@ fun MainSettingsScreen(
                     .size(40.dp)
                     .clip(CircleShape)
                     .border(1.5.dp, Color(0xFFEC6666), CircleShape)
+                    .clickable {
+                        navController.navigate("dev_profile_screen") { launchSingleTop = true }
+                    }
             ) {
                 Image(
                     painter = painterResource(id = R.drawable.hkdevpic),
@@ -1294,6 +1300,7 @@ fun AmbientSettingsScreen(
     var callIntel by remember { mutableStateOf(prefs.getBoolean("ambient_call_intel", false)) }
     var clockSize by remember { mutableFloatStateOf(prefs.getFloat("clock_size", 80f)) }
     var aodTimeout by remember { mutableIntStateOf(prefs.getInt("aod_timeout_seconds", 10)) }
+    var tapToWake by remember { mutableStateOf(prefs.getBoolean("tap_enabled", true)) }
     LaunchedEffect(Unit) {
         // Restores style, size and custom font from prefs.
         ClockStyleRepository.loadFromPrefs(context)
@@ -1415,6 +1422,18 @@ fun AmbientSettingsScreen(
                     }
                 }
             }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // ── Single Tap to Wake ──
+            AmbientToggleCard(
+                label = "Single Tap to Show AOD",
+                checked = tapToWake,
+                onCheckedChange = {
+                    tapToWake = it
+                    prefs.edit().putBoolean("tap_enabled", it).apply()
+                }
+            )
 
             Spacer(modifier = Modifier.height(12.dp))
 

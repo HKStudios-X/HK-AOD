@@ -248,32 +248,27 @@ fun AODScreen(
                 } else {
                     chargingWatts = ""
                     chargingLabel = ""
-                    // Discharge estimate (time left on battery).
-                    remainingTime = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        val powerManager = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-                        val remainingMillis = powerManager.batteryDischargePrediction?.toMillis()
-                        if (remainingMillis != null && remainingMillis > 0) {
-                            val hours = (remainingMillis / (1000 * 60 * 60)).toInt()
-                            val mins  = ((remainingMillis / (1000 * 60)) % 60).toInt()
-                            when {
-                                hours > 0 -> "${hours}h ${mins}m left"
-                                mins  > 0 -> "${mins}m left"
-                                else      -> ""
-                            }
-                        } else ""
-                    } else {
-                        if (reading.hasCurrent && reading.chargeCounterUah > 0) {
-                            val hoursLeft = reading.chargeCounterUah.toFloat() /
-                                    (reading.currentMa * 1000f)
-                            val hh = hoursLeft.toInt()
-                            val mm = ((hoursLeft - hh) * 60).toInt()
-                            when {
-                                hoursLeft > 500f -> ""
-                                hh > 0 -> "${hh}h ${mm}m left"
-                                mm > 0 -> "${mm}m left"
-                                else   -> ""
-                            }
-                        } else ""
+                    // Discharge estimate (time left on battery), best source first:
+                    //  1. Android 12+ system prediction (based on usage history)
+                    //  2. HKAOD's learned average drain rate (BatteryDrainTracker)
+                    //  3. Live current — pessimistic, because the AOD itself keeps
+                    //     the screen on, so it is marked approximate ("~").
+                    val systemHours: Float? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        val pm = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+                        pm.batteryDischargePrediction?.toMillis()
+                            ?.takeIf { it > 0 }
+                            ?.let { it / 3_600_000f }
+                    } else null
+                    val learnedHours = BatteryDrainTracker.hoursLeft(context, reading.levelPercent)
+                    val liveHours: Float? =
+                        if (reading.hasCurrent && reading.currentMa >= 20f && reading.chargeCounterUah > 0)
+                            reading.chargeCounterUah / (reading.currentMa * 1000f)
+                        else null
+
+                    remainingTime = when {
+                        systemHours != null  -> BatteryDrainTracker.format(systemHours)
+                        learnedHours != null -> BatteryDrainTracker.format(learnedHours)
+                        else                 -> BatteryDrainTracker.format(liveHours, approximate = true)
                     }
                 }
             } catch (e: Exception) {
@@ -934,7 +929,8 @@ fun AODMediaControlsRow(
 @Composable
 fun AODOverlayScreen(
     isAlwaysOn: Boolean,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onTimeout: () -> Unit = onDismiss
 ) {
     val context = LocalContext.current
 
@@ -971,9 +967,9 @@ fun AODOverlayScreen(
     }
 
     // Auto-dismiss after the user-configured AOD timeout (Ambient Settings);
-    // any touch resets the timer. The AOD only dismisses — it never locks the
-    // device — because it may have been opened by a glance gesture or the
-    // default double tap.
+    // any touch resets the timer. On timeout the service removes the AOD and,
+    // if the phone is still on the lock screen, turns the display off again
+    // (it never locks an already-unlocked phone).
     val timeoutMs = remember {
         (context.getSharedPreferences("HKAOD_PREFS", Context.MODE_PRIVATE)
             .getInt("aod_timeout_seconds", 10) * 1000L).coerceAtLeast(2_000L)
@@ -981,7 +977,7 @@ fun AODOverlayScreen(
     LaunchedEffect(isAlwaysOn, displayOn, interactionKey) {
         if (!isAlwaysOn && displayOn) {
             delay(timeoutMs)
-            onDismiss()
+            onTimeout()
         }
     }
 
