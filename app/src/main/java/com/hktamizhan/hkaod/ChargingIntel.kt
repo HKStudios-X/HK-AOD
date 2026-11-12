@@ -36,6 +36,95 @@ data class ChargingReading(
 }
 
 /**
+ * Learns the real average battery drain (% per hour) while unplugged, so the
+ * AOD can show "time remaining" on devices without the Android 12+
+ * PowerManager.batteryDischargePrediction. Fed by AODService on every
+ * ACTION_BATTERY_CHANGED; state lives in SharedPreferences so it survives
+ * process restarts.
+ *
+ *  * session rate  — drop since the phone was unplugged (needs ≥ 2 % and
+ *                    ≥ 15 min, so it reflects real mixed use, not one spike)
+ *  * history rate  — smoothed rate from previous discharge sessions, used
+ *                    until the current session has enough data
+ */
+object BatteryDrainTracker {
+    private const val PREFS = "HKAOD_PREFS"
+    private const val K_ANCHOR_AT    = "drain_anchor_at"
+    private const val K_ANCHOR_LEVEL = "drain_anchor_level"
+    private const val K_SESSION_RATE = "drain_session_rate"
+    private const val K_HISTORY_RATE = "drain_history_rate"
+
+    private const val MIN_DROP_PCT = 2
+    private const val MIN_ELAPSED_MS = 15 * 60 * 1000L
+
+    fun onBatteryChanged(context: Context, levelPercent: Int, plugged: Boolean) {
+        if (levelPercent !in 0..100) return
+        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val now = System.currentTimeMillis()
+        val anchorAt = p.getLong(K_ANCHOR_AT, 0L)
+
+        if (plugged) {
+            if (anchorAt != 0L) {
+                // Session over — fold its rate into the long-term history.
+                val session = p.getFloat(K_SESSION_RATE, 0f)
+                val history = p.getFloat(K_HISTORY_RATE, 0f)
+                val edit = p.edit().putLong(K_ANCHOR_AT, 0L).putFloat(K_SESSION_RATE, 0f)
+                if (session > 0f) {
+                    edit.putFloat(K_HISTORY_RATE, if (history > 0f) history * 0.6f + session * 0.4f else session)
+                }
+                edit.apply()
+            }
+            return
+        }
+
+        val anchorLevel = p.getInt(K_ANCHOR_LEVEL, -1)
+        // New session, or the level went *up* without a plug event (reboot,
+        // calibration jump) — re-anchor.
+        if (anchorAt == 0L || anchorLevel < 0 || levelPercent > anchorLevel) {
+            p.edit().putLong(K_ANCHOR_AT, now).putInt(K_ANCHOR_LEVEL, levelPercent)
+                .putFloat(K_SESSION_RATE, 0f).apply()
+            return
+        }
+
+        val dropped = anchorLevel - levelPercent
+        val elapsed = now - anchorAt
+        if (dropped >= MIN_DROP_PCT && elapsed >= MIN_ELAPSED_MS) {
+            val ratePerHour = dropped / (elapsed / 3_600_000f)
+            p.edit().putFloat(K_SESSION_RATE, ratePerHour).apply()
+        }
+    }
+
+    /** Estimated hours left at [levelPercent], or null if nothing learned yet. */
+    fun hoursLeft(context: Context, levelPercent: Int): Float? {
+        val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val session = p.getFloat(K_SESSION_RATE, 0f)
+        val history = p.getFloat(K_HISTORY_RATE, 0f)
+        val rate = when {
+            session > 0f -> session
+            history > 0f -> history
+            else -> return null
+        }.coerceAtLeast(0.3f) // never extrapolate beyond ~2 weeks
+        return levelPercent / rate
+    }
+
+    /** "1d 4h left", "5h 20m left", "45m left" — empty when not meaningful. */
+    fun format(hours: Float?, approximate: Boolean = false): String {
+        if (hours == null || hours.isNaN() || hours <= 0f || hours > 24f * 14f) return ""
+        val totalMin = (hours * 60f).toInt()
+        val d = totalMin / (60 * 24)
+        val h = (totalMin / 60) % 24
+        val m = totalMin % 60
+        val body = when {
+            d > 0 -> "${d}d ${h}h"
+            h > 0 -> "${h}h ${m}m"
+            m > 0 -> "${m}m"
+            else -> return ""
+        }
+        return (if (approximate) "~" else "") + "$body left"
+    }
+}
+
+/**
  * Robust reader for the values behind "Charging Speed Indication".
  *
  * The Android battery API is notoriously inconsistent across OEMs:
@@ -66,9 +155,15 @@ class ChargingIntelReader {
     private var counterRateAt = 0L
 
     // 1000 = the OEM reports µA (the documented unit), 1 = the OEM reports mA.
-    // 0 = not decided yet. Only decided while charging so idle readings cannot
-    // poison the unit for a later charging session.
-    private var currentDivisor = 0f
+    // 0 = not decided yet. Shared across reader instances (a new reader is
+    // created every time the AOD appears) so the decision survives.
+    private var currentDivisor: Float
+        get() = sharedDivisor
+        set(v) { sharedDivisor = v }
+
+    companion object {
+        @Volatile private var sharedDivisor = 0f
+    }
 
     private var lastLogSignature = ""
 
@@ -273,9 +368,23 @@ class ChargingIntelReader {
             }
         }
 
-        // No charging sample yet: use the documented µA unit. Don't persist
-        // this choice because idle/charge-counter values can be tiny.
-        val divisor = if (currentDivisor != 0f) currentDivisor else 1000f
+        // Not charging and no unit decided yet. A charge-counter rate, when
+        // available, settles it for good. Otherwise guess without persisting:
+        // the AOD only reads this with the screen on, when real drain is
+        // ≥ ~50 mA — i.e. ≥ 50,000 in µA. A raw value below 20,000 is
+        // therefore almost certainly mA (Samsung reports e.g. "271").
+        if (currentDivisor == 0f && !isCharging) {
+            val counterEstimate = counterRateMa
+            if (!counterEstimate.isNaN() && counterEstimate in 30f..25_000f) {
+                val micro = rawAbs / 1000f
+                currentDivisor = if (abs(micro - counterEstimate) <= abs(rawAbs - counterEstimate)) 1000f else 1f
+            }
+        }
+        val divisor = when {
+            currentDivisor != 0f -> currentDivisor
+            !isCharging && rawAbs in 5f..20_000f -> 1f
+            else -> 1000f
+        }
         var ma = rawAbs / divisor
 
         // Self-heal a bad unit guess: a mA-mode reading above 20 A means the
